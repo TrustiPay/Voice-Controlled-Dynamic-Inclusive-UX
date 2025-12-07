@@ -1,0 +1,11 @@
+[
+  {
+    "id": "t1",
+    "type": "transfer",
+    "to_contact_id": "c1",
+    "to_label": "Kevin at work",
+    "amount_lkr": 4000,
+    "note": "Thank you for the tickets",
+    "timestamp": "2026-01-03T12:34:56Z"
+  }
+]
