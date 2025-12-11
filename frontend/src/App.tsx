@@ -1,34 +1,58 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
+import { useRef, useState } from 'react'
 import './App.css'
+import { playWavBytes } from './voice/audio'
+import { connectVoiceWS } from './voice/ws'
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [assistantText, setAssistantText] = useState<string>('')
+  const [connected, setConnected] = useState<boolean>(false)
+  const expectingAudio = useRef(false)
+  const wsRef = useRef<WebSocket | null>(null)
+
+  const handleJson = (data: any) => {
+    if (!data || typeof data !== 'object') return
+    if (data.type === 'AGENT_MESSAGE') {
+      setAssistantText(data.text ?? '')
+    }
+    if (data.type === 'TTS_AUDIO') {
+      expectingAudio.current = true
+    }
+  }
+
+  const handleBinary = (bytes: ArrayBuffer) => {
+    if (expectingAudio.current) {
+      expectingAudio.current = false
+      playWavBytes(bytes).catch((err) => console.error('Audio playback failed', err))
+    }
+  }
+
+  const handleStart = () => {
+    if (wsRef.current) return
+    wsRef.current = connectVoiceWS(handleJson, handleBinary, () => setConnected(true))
+    wsRef.current.onclose = () => {
+      wsRef.current = null
+      setConnected(false)
+    }
+  }
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
+    <div className="app-shell">
+      <header>
+        <h1>TrustiPay Voice Prototype</h1>
+        <p>Milestone A — WebSocket greeting + TTS beep</p>
+      </header>
+
+      <main>
+        <button className="start-button" onClick={handleStart} disabled={connected}>
+          {connected ? 'Connected' : 'Start'}
         </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
+
+        <div className="message-panel">
+          <h2>Assistant</h2>
+          <p className="assistant-text">{assistantText || 'Waiting for greeting...'}</p>
+        </div>
+      </main>
+    </div>
   )
 }
 
