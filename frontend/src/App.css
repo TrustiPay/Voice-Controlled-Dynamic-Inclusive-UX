@@ -28,6 +28,11 @@ main {
   gap: 1rem;
 }
 
+.controls {
+  display: flex;
+  gap: 0.75rem;
+}
+
 .start-button {
   background: linear-gradient(135deg, #2563eb, #1d4ed8);
   color: #fff;
@@ -51,6 +56,21 @@ main {
   box-shadow: 0 14px 32px rgba(37, 99, 235, 0.3);
 }
 
+.stop-button {
+  background: #e2e8f0;
+  color: #0f172a;
+  border: none;
+  border-radius: 12px;
+  padding: 0.9rem 1.25rem;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.stop-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .message-panel {
   border: 1px solid #e2e8f0;
   border-radius: 12px;
@@ -67,4 +87,20 @@ main {
   margin: 0;
   min-height: 2rem;
   color: #0f172a;
+}
+
+.stats-panel {
+  border: 1px dashed #cbd5e1;
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  background: #f1f5f9;
+}
+
+.stats-panel h2 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1.05rem;
+}
+
+.stats-panel p {
+  margin: 0.1rem 0;
 }
