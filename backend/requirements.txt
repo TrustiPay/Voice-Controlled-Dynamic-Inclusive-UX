@@ -1,2 +1,5 @@
 fastapi
 uvicorn[standard]
+numpy
+torch
+faster-whisper
