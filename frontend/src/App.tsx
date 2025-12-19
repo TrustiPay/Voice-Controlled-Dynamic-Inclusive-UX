@@ -9,6 +9,8 @@ function App() {
   const [connected, setConnected] = useState<boolean>(false)
   const [streaming, setStreaming] = useState<boolean>(false)
   const [audioStats, setAudioStats] = useState<{ total_bytes: number; seconds_estimate: number } | null>(null)
+  const [transcripts, setTranscripts] = useState<string[]>([])
+  const [lastAsrAt, setLastAsrAt] = useState<number>(0)
   const expectingAudio = useRef(false)
   const wsRef = useRef<WebSocket | null>(null)
   const stopMicRef = useRef<(() => void) | null>(null)
@@ -24,6 +26,13 @@ function App() {
     if (data.type === 'AUDIO_STATS') {
       setAudioStats({ total_bytes: data.total_bytes, seconds_estimate: data.seconds_estimate })
     }
+    if (data.type === 'ASR_FINAL') {
+      const text = data.text ?? ''
+      if (text) {
+        setTranscripts((prev) => [...prev, text])
+        setLastAsrAt(Date.now())
+      }
+    }
   }
 
   const handleBinary = (bytes: ArrayBuffer) => {
@@ -35,6 +44,8 @@ function App() {
 
   const handleStart = async () => {
     if (wsRef.current) return
+    setTranscripts([])
+    setAudioStats(null)
     wsRef.current = connectVoiceWS(handleJson, handleBinary, async () => {
       setConnected(true)
       wsRef.current?.send(
@@ -76,7 +87,7 @@ function App() {
     <div className="app-shell">
       <header>
         <h1>TrustiPay Voice Prototype</h1>
-        <p>Milestone B — Mic streaming + audio stats</p>
+        <p>Milestone C — VAD + ASR transcripts</p>
       </header>
 
       <main>
@@ -87,6 +98,7 @@ function App() {
           <button className="stop-button" onClick={handleStop} disabled={!connected}>
             Stop
           </button>
+          <span className={`listening-pill ${streaming ? 'on' : 'off'}`}>{streaming ? 'Listening…' : 'Idle'}</span>
         </div>
 
         <div className="message-panel">
@@ -100,6 +112,22 @@ function App() {
           <p>
             Total bytes: {audioStats ? audioStats.total_bytes : 0} ({audioStats ? audioStats.seconds_estimate : 0} sec est.)
           </p>
+        </div>
+
+        <div className="transcript-panel">
+          <div className="transcript-header">
+            <h2>ASR Transcript</h2>
+            <span className={`asr-indicator ${Date.now() - lastAsrAt < 1200 ? 'flash' : ''}`}>Final</span>
+          </div>
+          {transcripts.length === 0 ? (
+            <p className="assistant-text">Speak to see transcripts here.</p>
+          ) : (
+            <ul>
+              {transcripts.map((t, idx) => (
+                <li key={`${idx}-${t.slice(0, 8)}`}>{t}</li>
+              ))}
+            </ul>
+          )}
         </div>
       </main>
     </div>

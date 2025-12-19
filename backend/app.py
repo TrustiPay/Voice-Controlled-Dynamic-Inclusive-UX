@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-import time
-
+from asr import transcribe_pcm16k
 from tts import synthesize_wav
+from vad import SileroVAD
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("trustipay.app")
@@ -66,6 +67,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         "total_audio_bytes": 0,
         "bytes_since_stats": 0,
         "last_stats_time": time.monotonic(),
+        "vad": SileroVAD(),
+        "utterance_count": 0,
     }
     stats_interval_bytes = 32_000  # ~1 second at 16kHz mono 16-bit
     try:
@@ -103,6 +106,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     )
                     session["bytes_since_stats"] = 0
                     session["last_stats_time"] = time.monotonic()
+
+                # VAD + ASR
+                try:
+                    utterances = session["vad"].accept_bytes(chunk)
+                except Exception as exc:  # safeguard against VAD errors
+                    logger.exception("VAD processing failed: %s", exc)
+                    utterances = []
+
+                for utterance in utterances:
+                    transcript = ""
+                    try:
+                        transcript = transcribe_pcm16k(utterance)
+                    except Exception as exc:
+                        logger.exception("ASR transcription failed: %s", exc)
+                    if transcript:
+                        session["utterance_count"] += 1
+                        await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
