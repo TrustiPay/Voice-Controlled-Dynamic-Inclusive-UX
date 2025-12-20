@@ -8,7 +8,9 @@ from typing import Any, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from agent import handle_biometric_ok, handle_user_text
 from asr import transcribe_pcm16k
+from state import SessionState
 from tts import synthesize_wav
 from vad import SileroVAD
 
@@ -32,6 +34,16 @@ async def _send_greeting(websocket: WebSocket, user_name: str) -> None:
     await websocket.send_bytes(wav_bytes)
 
 
+async def _send_response(websocket: WebSocket, say: str, ui_actions: list[dict[str, Any]] | None = None) -> None:
+    await websocket.send_json({"type": "AGENT_MESSAGE", "text": say})
+    if ui_actions:
+        await websocket.send_json({"type": "UI_ACTIONS", "actions": ui_actions})
+    if say:
+        wav_bytes = synthesize_wav(say)
+        await websocket.send_json({"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(wav_bytes)})
+        await websocket.send_bytes(wav_bytes)
+
+
 async def _handle_client_message(
     websocket: WebSocket,
     payload: Dict[str, Any],
@@ -44,12 +56,21 @@ async def _handle_client_message(
     if msg_type == "START_SESSION":
         user = payload.get("user") or {}
         user_name = user.get("name", "John")
+        session["state"].reset(user_id=user.get("id", "anon"), user_name=user_name, language=payload.get("language", "en"))
         await _send_greeting(websocket, user_name)
         return True
 
     if msg_type == "AUDIO_CONFIG":
         session["audio_config"] = payload
         logger.info("Audio config set: %s", payload)
+        return True
+
+    if msg_type == "BIOMETRIC_RESULT":
+        if payload.get("ok"):
+            response = handle_biometric_ok(session["state"])
+            await _send_response(websocket, response["say"], response["ui_actions"])
+        else:
+            await _send_response(websocket, "Fingerprint verification failed. Please try again.", [])
         return True
 
     if msg_type == "STOP":
@@ -69,6 +90,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         "last_stats_time": time.monotonic(),
         "vad": SileroVAD(),
         "utterance_count": 0,
+        "state": SessionState(),
     }
     stats_interval_bytes = 32_000  # ~1 second at 16kHz mono 16-bit
     try:
@@ -123,6 +145,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if transcript:
                         session["utterance_count"] += 1
                         await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
+                        response = handle_user_text(session["state"], transcript)
+                        await _send_response(websocket, response["say"], response["ui_actions"])
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
