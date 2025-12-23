@@ -85,6 +85,14 @@ main {
   color: #0369a1;
 }
 
+.screen-chip {
+  padding: 0.4rem 0.75rem;
+  border-radius: 10px;
+  background: #eef2ff;
+  color: #312e81;
+  font-size: 0.9rem;
+}
+
 .message-panel {
   border: 1px solid #e2e8f0;
   border-radius: 12px;
@@ -117,6 +125,73 @@ main {
 
 .stats-panel p {
   margin: 0.1rem 0;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1rem;
+}
+
+.panel {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  background: #fff;
+}
+
+.flow-panel .field-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.35rem 0;
+  border-bottom: 1px dashed #e2e8f0;
+}
+
+.flow-panel .field-row:last-child {
+  border-bottom: none;
+}
+
+.confirm-panel {
+  background: #f8fafc;
+}
+
+.fingerprint-btn {
+  margin-top: 0.5rem;
+  padding: 0.8rem 1rem;
+  border-radius: 10px;
+  background: #16a34a;
+  color: #fff;
+  border: none;
+  cursor: pointer;
+}
+
+.success-panel ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.history-list li {
+  border-bottom: 1px solid #e2e8f0;
+  padding: 0.5rem 0;
+}
+
+.history-list li:last-child {
+  border-bottom: none;
+}
+
+.history-title {
+  font-weight: 600;
+}
+
+.history-meta {
+  color: #475569;
+  font-size: 0.95rem;
+}
+
+.history-note {
+  color: #0f172a;
+  font-size: 0.9rem;
 }
 
 .transcript-panel {
@@ -155,4 +230,12 @@ main {
   color: #166534;
   box-shadow: 0 0 0 6px rgba(220, 252, 231, 0.5);
   transition: box-shadow 200ms ease;
+}
+
+.toast {
+  background: #0ea5e9;
+  color: #fff;
+  padding: 0.8rem 1rem;
+  border-radius: 10px;
+  display: inline-block;
 }
