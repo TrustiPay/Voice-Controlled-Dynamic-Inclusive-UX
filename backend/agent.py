@@ -42,6 +42,19 @@ def _build_confirm_summary(state: SessionState) -> str:
     return base + ". Approve with fingerprint to continue."
 
 
+def _progress_to_confirm(state: SessionState, actions: List[Dict[str, Any]]) -> str:
+    state.step = "awaiting_biometric"
+    state.draft_summary = _build_confirm_summary(state)
+    actions.extend(
+        [
+            _nav("confirm"),
+            _show_confirm(state.draft_summary),
+            _prompt_biometric(),
+        ]
+    )
+    return state.draft_summary
+
+
 def handle_user_text(state: SessionState, text: str) -> Dict[str, Any]:
     """
     Deterministic dialogue manager; returns dict with 'say' and 'ui_actions'.
@@ -81,6 +94,9 @@ def handle_user_text(state: SessionState, text: str) -> Dict[str, Any]:
             if possible_note:
                 state.note = possible_note
                 actions.append(_set_field("note", possible_note))
+                if state.recipient_contact_id:
+                    say = _progress_to_confirm(state, actions)
+                    return {"say": say, "ui_actions": actions}
             state.step = "collect_note_optional"
             say = "Got it. Do you want to add a note?"
         else:
@@ -97,16 +113,7 @@ def handle_user_text(state: SessionState, text: str) -> Dict[str, Any]:
                 actions.append(_set_field("note", note))
         # proceed to confirm once note decision is made (even if empty)
         if state.recipient_contact_id and state.amount_lkr:
-            state.step = "awaiting_biometric"
-            state.draft_summary = _build_confirm_summary(state)
-            actions.extend(
-                [
-                    _nav("confirm"),
-                    _show_confirm(state.draft_summary),
-                    _prompt_biometric(),
-                ]
-            )
-            say = state.draft_summary
+            say = _progress_to_confirm(state, actions)
         else:
             say = "I need both recipient and amount before confirming."
         return {"say": say, "ui_actions": actions}

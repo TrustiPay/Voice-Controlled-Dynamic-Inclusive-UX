@@ -68,6 +68,7 @@ async def _handle_client_message(
     if msg_type == "BIOMETRIC_RESULT":
         if payload.get("ok"):
             response = handle_biometric_ok(session["state"])
+            logger.info("Biometric OK -> %s", response["ui_actions"])
             await _send_response(websocket, response["say"], response["ui_actions"])
         else:
             await _send_response(websocket, "Fingerprint verification failed. Please try again.", [])
@@ -144,8 +145,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         logger.exception("ASR transcription failed: %s", exc)
                     if transcript:
                         session["utterance_count"] += 1
+                        logger.info("ASR_FINAL: %s", transcript)
                         await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
                         response = handle_user_text(session["state"], transcript)
+                        logger.info(
+                            "State step=%s recipient=%s amount=%s note=%s actions=%s",
+                            session["state"].step,
+                            session["state"].recipient_label,
+                            session["state"].amount_lkr,
+                            session["state"].note,
+                            response["ui_actions"],
+                        )
                         await _send_response(websocket, response["say"], response["ui_actions"])
 
     except WebSocketDisconnect:

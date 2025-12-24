@@ -110,6 +110,12 @@ function App() {
     setAudioStats(null)
     setAssistantText('')
     setScreen('home')
+    setRecipient('')
+    setAmount(null)
+    setNote('')
+    setConfirmSummary('')
+    setHistory([])
+    setBiometricPrompt(false)
     wsRef.current = connectVoiceWS(handleJson, handleBinary, async () => {
       setConnected(true)
       wsRef.current?.send(
