@@ -25,8 +25,6 @@ class SessionState:
     draft_summary: Optional[str] = None
     pending_transfer: Optional[Dict[str, Any]] = None
 
-    awaiting_biometric: bool = False
-
     audio_config: Dict[str, Any] = field(default_factory=dict)
     bytes_received: int = 0
 
@@ -46,8 +44,6 @@ class SessionState:
         self.note = None
         self.draft_summary = None
         self.pending_transfer = None
-
-        self.awaiting_biometric = False
 
         self.audio_config = {}
         self.bytes_received = 0

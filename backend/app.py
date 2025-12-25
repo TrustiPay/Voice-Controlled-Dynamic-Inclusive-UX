@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -13,6 +14,35 @@ from asr import transcribe_pcm16k
 from state import SessionState
 from tts import synthesize_wav
 from vad import SileroVAD
+
+
+@dataclass
+class WsSession:
+    state: SessionState = field(default_factory=SessionState)
+    audio_config: Dict[str, Any] = field(default_factory=dict)
+    total_audio_bytes: int = 0
+    bytes_since_stats: int = 0
+    last_stats_time: float = field(default_factory=time.monotonic)
+    vad: SileroVAD = field(default_factory=SileroVAD)
+    utterance_count: int = 0
+    stats_interval_bytes: int = 32_000  # ~1 second at 16kHz mono 16-bit
+
+    def record_bytes(self, size: int) -> None:
+        self.total_audio_bytes += size
+        self.bytes_since_stats += size
+
+    def pop_stats(self, sample_rate: int) -> Dict[str, Any] | None:
+        if self.bytes_since_stats < self.stats_interval_bytes:
+            return None
+        total_bytes = self.total_audio_bytes
+        seconds_estimate = total_bytes / 2 / max(sample_rate, 1)
+        self.bytes_since_stats = 0
+        self.last_stats_time = time.monotonic()
+        return {
+            "type": "AUDIO_STATS",
+            "total_bytes": total_bytes,
+            "seconds_estimate": round(seconds_estimate, 2),
+        }
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("trustipay.app")
@@ -47,7 +77,7 @@ async def _send_response(websocket: WebSocket, say: str, ui_actions: list[dict[s
 async def _handle_client_message(
     websocket: WebSocket,
     payload: Dict[str, Any],
-    session: Dict[str, Any],
+    session: WsSession,
 ) -> bool:
     """
     Returns False if the loop should terminate.
@@ -56,18 +86,18 @@ async def _handle_client_message(
     if msg_type == "START_SESSION":
         user = payload.get("user") or {}
         user_name = user.get("name", "John")
-        session["state"].reset(user_id=user.get("id", "anon"), user_name=user_name, language=payload.get("language", "en"))
+        session.state.reset(user_id=user.get("id", "anon"), user_name=user_name, language=payload.get("language", "en"))
         await _send_greeting(websocket, user_name)
         return True
 
     if msg_type == "AUDIO_CONFIG":
-        session["audio_config"] = payload
+        session.audio_config = payload
         logger.info("Audio config set: %s", payload)
         return True
 
     if msg_type == "BIOMETRIC_RESULT":
         if payload.get("ok"):
-            response = handle_biometric_ok(session["state"])
+            response = handle_biometric_ok(session.state)
             logger.info("Biometric OK -> %s", response["ui_actions"])
             await _send_response(websocket, response["say"], response["ui_actions"])
         else:

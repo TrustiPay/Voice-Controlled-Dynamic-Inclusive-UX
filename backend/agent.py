@@ -4,13 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from heuristics import (
-    detect_transfer_intent,
-    extract_amount,
-    extract_amount_and_note,
-    extract_note,
-    extract_recipient,
-)
+from heuristics import detect_transfer_intent, extract_amount_and_note, extract_note, extract_recipient
 from state import SessionState
 from tools import append_ledger_entry, get_ledger, search_contact
 
