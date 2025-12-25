@@ -114,16 +114,7 @@ async def _handle_client_message(
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
-    session: Dict[str, Any] = {
-        "audio_config": None,
-        "total_audio_bytes": 0,
-        "bytes_since_stats": 0,
-        "last_stats_time": time.monotonic(),
-        "vad": SileroVAD(),
-        "utterance_count": 0,
-        "state": SessionState(),
-    }
-    stats_interval_bytes = 32_000  # ~1 second at 16kHz mono 16-bit
+    session = WsSession()
     try:
         while True:
             message = await websocket.receive()
@@ -143,26 +134,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             elif message.get("bytes") is not None:
                 chunk = message["bytes"] or b""
                 chunk_len = len(chunk)
-                session["total_audio_bytes"] += chunk_len
-                session["bytes_since_stats"] += chunk_len
+                session.record_bytes(chunk_len)
 
-                if session["bytes_since_stats"] >= stats_interval_bytes:
-                    total_bytes = session["total_audio_bytes"]
-                    sample_rate = (session.get("audio_config") or {}).get("sample_rate", 16_000)
-                    seconds_estimate = total_bytes / 2 / max(sample_rate, 1)
-                    await websocket.send_json(
-                        {
-                            "type": "AUDIO_STATS",
-                            "total_bytes": total_bytes,
-                            "seconds_estimate": round(seconds_estimate, 2),
-                        }
-                    )
-                    session["bytes_since_stats"] = 0
-                    session["last_stats_time"] = time.monotonic()
+                sample_rate = (session.audio_config or {}).get("sample_rate", 16_000)
+                stats_payload = session.pop_stats(sample_rate)
+                if stats_payload:
+                    await websocket.send_json(stats_payload)
 
                 # VAD + ASR
                 try:
-                    utterances = session["vad"].accept_bytes(chunk)
+                    utterances = session.vad.accept_bytes(chunk)
                 except Exception as exc:  # safeguard against VAD errors
                     logger.exception("VAD processing failed: %s", exc)
                     utterances = []
@@ -174,16 +155,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     except Exception as exc:
                         logger.exception("ASR transcription failed: %s", exc)
                     if transcript:
-                        session["utterance_count"] += 1
+                        session.utterance_count += 1
                         logger.info("ASR_FINAL: %s", transcript)
                         await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
-                        response = handle_user_text(session["state"], transcript)
+                        response = handle_user_text(session.state, transcript)
                         logger.info(
                             "State step=%s recipient=%s amount=%s note=%s actions=%s",
-                            session["state"].step,
-                            session["state"].recipient_label,
-                            session["state"].amount_lkr,
-                            session["state"].note,
+                            session.state.step,
+                            session.state.recipient_label,
+                            session.state.amount_lkr,
+                            session.state.note,
                             response["ui_actions"],
                         )
                         await _send_response(websocket, response["say"], response["ui_actions"])

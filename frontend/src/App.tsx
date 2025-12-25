@@ -52,6 +52,7 @@ function App() {
           break
         case 'SHOW_CONFIRM':
           setConfirmSummary(action.summary ?? '')
+          if (screen !== 'confirm') setScreen('confirm')
           break
         case 'PROMPT_BIOMETRIC':
           setBiometricPrompt(true)

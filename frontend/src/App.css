@@ -153,6 +153,7 @@ main {
 
 .confirm-panel {
   background: #f8fafc;
+  min-height: 140px;
 }
 
 .fingerprint-btn {
@@ -163,6 +164,7 @@ main {
   color: #fff;
   border: none;
   cursor: pointer;
+  width: 100%;
 }
 
 .success-panel ul {
