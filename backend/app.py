@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -117,6 +117,37 @@ def _apply_actions_to_state(state: SessionState, actions: list[dict[str, Any]]) 
             state.step = "awaiting_biometric"
 
 
+async def _process_decision(websocket: WebSocket, session: WsSession, decision: AgentDecision) -> Optional[ToolCall]:
+    apply_state_patch(session.state, decision.state_patch)
+    actions = _serialize_actions(decision.ui_actions)
+    _apply_actions_to_state(session.state, actions)
+    await _send_response(websocket, decision.say, actions)
+    session.add_message("assistant", decision.say)
+    return decision.tool_call
+
+
+async def _run_decision_flow(
+    websocket: WebSocket,
+    session: WsSession,
+    user_text: Optional[str] = None,
+    last_tool_result: Optional[Dict[str, Any]] = None,
+) -> None:
+    loops = 0
+    decision = agent.decide(session.state, user_text, last_tool_result, session.recent_messages())
+    tool_call = await _process_decision(websocket, session, decision)
+
+    while tool_call and loops < 2:
+        loops += 1
+        try:
+            tool_result = execute_tool_call(session.state, tool_call)
+        except Exception as exc:
+            logger.exception("Tool call failed: %s", exc)
+            tool_result = {"error": "exception", "detail": str(exc)}
+
+        decision = agent.decide(session.state, None, tool_result, session.recent_messages())
+        tool_call = await _process_decision(websocket, session, decision)
+
+
 async def _handle_client_message(
     websocket: WebSocket,
     payload: Dict[str, Any],
@@ -141,11 +172,11 @@ async def _handle_client_message(
     if msg_type == "BIOMETRIC_RESULT":
         if payload.get("ok"):
             response = handle_biometric_ok(session.state)
-        logger.info("Biometric OK -> %s", response["ui_actions"])
-        await _send_response(websocket, response["say"], response["ui_actions"])
-    else:
-        await _send_response(websocket, "Fingerprint verification failed. Please try again.", [])
-    return True
+            logger.info("Biometric OK -> %s", response["ui_actions"])
+            await _send_response(websocket, response["say"], response["ui_actions"])
+        else:
+            await _send_response(websocket, "Fingerprint verification failed. Please try again.", [])
+        return True
 
     if msg_type == "STOP":
         await websocket.send_json({"type": "END", "reason": "stopped"})
