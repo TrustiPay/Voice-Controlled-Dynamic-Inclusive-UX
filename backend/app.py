@@ -9,7 +9,14 @@ from typing import Any, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from agent import handle_biometric_ok, handle_user_text
+from agent import (
+    AgentDecision,
+    LlmAgent,
+    ToolCall,
+    apply_state_patch,
+    execute_tool_call,
+    handle_biometric_ok,
+)
 from asr import transcribe_pcm16k
 from state import SessionState
 from tts import synthesize_wav
@@ -26,6 +33,7 @@ class WsSession:
     vad: SileroVAD = field(default_factory=SileroVAD)
     utterance_count: int = 0
     stats_interval_bytes: int = 32_000  # ~1 second at 16kHz mono 16-bit
+    messages: list[Dict[str, str]] = field(default_factory=list)
 
     def record_bytes(self, size: int) -> None:
         self.total_audio_bytes += size
@@ -44,10 +52,20 @@ class WsSession:
             "seconds_estimate": round(seconds_estimate, 2),
         }
 
+    def add_message(self, role: str, content: str) -> None:
+        if not content:
+            return
+        self.messages.append({"role": role, "content": content})
+        self.messages = self.messages[-8:]
+
+    def recent_messages(self) -> list[Dict[str, str]]:
+        return self.messages[-8:]
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("trustipay.app")
 
 app = FastAPI(title="TrustiPay Prototype")
+agent = LlmAgent()
 
 
 @app.get("/health")
@@ -74,6 +92,31 @@ async def _send_response(websocket: WebSocket, say: str, ui_actions: list[dict[s
         await websocket.send_bytes(wav_bytes)
 
 
+def _serialize_actions(actions: list[Any]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for action in actions:
+        if hasattr(action, "model_dump"):
+            serialized.append(action.model_dump(exclude_none=True))
+        elif isinstance(action, dict):
+            serialized.append({k: v for k, v in action.items() if v is not None})
+    return serialized
+
+
+def _apply_actions_to_state(state: SessionState, actions: list[dict[str, Any]]) -> None:
+    for action in actions:
+        if action.get("type") == "SET_FIELD":
+            field = action.get("field")
+            value = action.get("value")
+            if field == "recipient":
+                state.recipient_label = value
+            elif field == "amount":
+                state.amount_lkr = value
+            elif field == "note":
+                state.note = value
+        if action.get("type") == "PROMPT_BIOMETRIC":
+            state.step = "awaiting_biometric"
+
+
 async def _handle_client_message(
     websocket: WebSocket,
     payload: Dict[str, Any],
@@ -98,11 +141,11 @@ async def _handle_client_message(
     if msg_type == "BIOMETRIC_RESULT":
         if payload.get("ok"):
             response = handle_biometric_ok(session.state)
-            logger.info("Biometric OK -> %s", response["ui_actions"])
-            await _send_response(websocket, response["say"], response["ui_actions"])
-        else:
-            await _send_response(websocket, "Fingerprint verification failed. Please try again.", [])
-        return True
+        logger.info("Biometric OK -> %s", response["ui_actions"])
+        await _send_response(websocket, response["say"], response["ui_actions"])
+    else:
+        await _send_response(websocket, "Fingerprint verification failed. Please try again.", [])
+    return True
 
     if msg_type == "STOP":
         await websocket.send_json({"type": "END", "reason": "stopped"})
@@ -158,16 +201,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         session.utterance_count += 1
                         logger.info("ASR_FINAL: %s", transcript)
                         await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
-                        response = handle_user_text(session.state, transcript)
-                        logger.info(
-                            "State step=%s recipient=%s amount=%s note=%s actions=%s",
-                            session.state.step,
-                            session.state.recipient_label,
-                            session.state.amount_lkr,
-                            session.state.note,
-                            response["ui_actions"],
-                        )
-                        await _send_response(websocket, response["say"], response["ui_actions"])
+                        session.add_message("user", transcript)
+                        await _run_decision_flow(websocket, session, user_text=transcript)
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")

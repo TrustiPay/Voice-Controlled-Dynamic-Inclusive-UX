@@ -3,3 +3,6 @@ uvicorn[standard]
 numpy
 torch
 faster-whisper
+langchain
+langchain-community
+pydantic
