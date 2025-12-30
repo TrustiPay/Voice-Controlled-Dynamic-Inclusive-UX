@@ -1,43 +1,42 @@
-export type JsonHandler = (data: any) => void
-export type BinaryHandler = (data: ArrayBuffer) => void
-export type OpenHandler = () => void
+export function connectVoiceWS(
+  onJson: (payload: any) => void,
+  onBinary: (data: ArrayBuffer) => void
+): WebSocket {
+  const ws = new WebSocket("ws://localhost:8000/ws");
+  ws.binaryType = "arraybuffer";
 
-export function connectVoiceWS(onJson: JsonHandler, onBinary: BinaryHandler, onOpen?: OpenHandler): WebSocket {
-  const ws = new WebSocket('ws://localhost:8000/ws')
-  ws.binaryType = 'arraybuffer'
+  ws.addEventListener("open", () => {
+    ws.send(
+      JSON.stringify({
+        type: "START_SESSION",
+        user: { id: "u1", name: "John" },
+        language: "en",
+      })
+    );
+  });
 
-  ws.onopen = () => {
-    const startPayload = {
-      type: 'START_SESSION',
-      user: { id: 'u1', name: 'John' },
-      language: 'en',
-    }
-    ws.send(JSON.stringify(startPayload))
-    onOpen?.()
-  }
-
-  ws.onmessage = (event: MessageEvent) => {
-    const { data } = event
-    if (typeof data === 'string') {
+  ws.addEventListener("message", (event) => {
+    if (typeof event.data === "string") {
       try {
-        const parsed = JSON.parse(data)
-        onJson(parsed)
+        const payload = JSON.parse(event.data);
+        onJson(payload);
       } catch (err) {
-        console.error('Failed to parse JSON from WS', err)
+        console.warn("Failed to parse JSON message", err);
       }
-      return
+      return;
     }
 
-    // Blob or ArrayBuffer
-    if (data instanceof ArrayBuffer) {
-      onBinary(data)
-      return
+    if (event.data instanceof ArrayBuffer) {
+      onBinary(event.data);
+      return;
     }
 
-    if (data instanceof Blob) {
-      data.arrayBuffer().then(onBinary).catch((err) => console.error('Blob to ArrayBuffer failed', err))
+    if (event.data instanceof Blob) {
+      event.data.arrayBuffer().then(onBinary).catch((err) => {
+        console.error("Failed to read binary message", err);
+      });
     }
-  }
+  });
 
-  return ws
+  return ws;
 }

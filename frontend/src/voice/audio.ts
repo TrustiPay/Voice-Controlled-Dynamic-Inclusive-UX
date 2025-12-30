@@ -1,11 +1,14 @@
-export async function playWavBytes(bytes: ArrayBuffer): Promise<void> {
-  const blob = new Blob([bytes], { type: 'audio/wav' })
-  const url = URL.createObjectURL(blob)
-  const audio = new Audio(url)
+export async function playWavBytes(buffer: ArrayBuffer) {
+  const blob = new Blob([buffer], { type: "audio/wav" });
+  const url = URL.createObjectURL(blob);
 
+  const audio = new Audio(url);
   try {
-    await audio.play()
+    await audio.play();
   } finally {
-    URL.revokeObjectURL(url)
+    // Allow the browser to reclaim the URL once playback finishes
+    audio.addEventListener("ended", () => URL.revokeObjectURL(url), {
+      once: true,
+    });
   }
 }
