@@ -30,9 +30,9 @@ function StatusBadge({ label }: { label: string }) {
 
 export default function App() {
   const [status, setStatus] = useState("Disconnected");
-  const [assistantMessages, setAssistantMessages] = useState<AssistantMessage[]>(
-    []
-  );
+  const [assistantMessages, setAssistantMessages] = useState<
+    AssistantMessage[]
+  >([]);
   const [audioStatus, setAudioStatus] = useState("Idle");
   const [hasStarted, setHasStarted] = useState(false);
   const [micStatus, setMicStatus] = useState("Idle");
@@ -71,7 +71,8 @@ export default function App() {
           }
           break;
         case "SET_FIELD":
-          if (action.field === "recipient") setRecipientField(action.value ?? "");
+          if (action.field === "recipient")
+            setRecipientField(action.value ?? "");
           if (action.field === "amount")
             setAmountField(
               action.value !== undefined && action.value !== null
@@ -139,13 +140,17 @@ export default function App() {
             <div className="space-y-2 text-sm">
               <label className="block text-slate-400">Recipient</label>
               <div className="rounded-xl bg-slate-900 px-3 py-2 ring-1 ring-slate-800">
-                {recipientField || <span className="text-slate-500">Waiting…</span>}
+                {recipientField || (
+                  <span className="text-slate-500">Waiting…</span>
+                )}
               </div>
             </div>
             <div className="space-y-2 text-sm">
               <label className="block text-slate-400">Amount (LKR)</label>
               <div className="rounded-xl bg-slate-900 px-3 py-2 ring-1 ring-slate-800">
-                {amountField || <span className="text-slate-500">Waiting…</span>}
+                {amountField || (
+                  <span className="text-slate-500">Waiting…</span>
+                )}
               </div>
             </div>
             <div className="space-y-2 text-sm">
@@ -208,7 +213,9 @@ export default function App() {
                       {item.timestamp?.replace("T", " ")}
                     </div>
                     {item.note && (
-                      <div className="text-xs text-slate-300">Note: {item.note}</div>
+                      <div className="text-xs text-slate-300">
+                        Note: {item.note}
+                      </div>
                     )}
                   </div>
                 ))}
@@ -325,7 +332,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100">
+    <div className="min-h-screen bg-linear-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100">
       <div className="mx-auto flex max-w-5xl flex-col gap-8 px-4 py-10">
         <header className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
@@ -351,10 +358,12 @@ export default function App() {
           <div className="rounded-3xl border border-slate-800 bg-slate-900/80 p-5 shadow-xl shadow-black/30 backdrop-blur">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-xs uppercase tracking-[0.1em] text-slate-400">
+                <p className="text-xs uppercase tracking-widest text-slate-400">
                   Session
                 </p>
-                <p className="text-lg font-semibold text-white">Push to start</p>
+                <p className="text-lg font-semibold text-white">
+                  Push to start
+                </p>
               </div>
               <div className="flex items-center gap-2">
                 {micStatus === "Streaming" && (
@@ -371,7 +380,9 @@ export default function App() {
                 disabled={hasStarted && status === "Connected"}
                 onClick={handleStart}
               >
-                {status === "Connected" ? "Session running" : "Start Voice Session"}
+                {status === "Connected"
+                  ? "Session running"
+                  : "Start Voice Session"}
               </button>
               <button
                 className="rounded-xl bg-slate-800 px-4 py-3 text-center text-base font-semibold text-slate-100 transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-800/70 disabled:text-slate-500"
@@ -430,31 +441,45 @@ export default function App() {
             </div>
 
             <div>
-              <h2 className="text-lg font-semibold text-white">What this demo does</h2>
+              <h2 className="text-lg font-semibold text-white">
+                What this demo does
+              </h2>
               <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-slate-200">
                 <li>Connects to FastAPI /ws on localhost:8000.</li>
-                <li>Sends a START_SESSION payload with the hardcoded user John.</li>
-                <li>Declares AUDIO_CONFIG and streams 16 kHz pcm_s16le mic audio.</li>
+                <li>
+                  Sends a START_SESSION payload with the hardcoded user John.
+                </li>
+                <li>
+                  Declares AUDIO_CONFIG and streams 16 kHz pcm_s16le mic audio.
+                </li>
                 <li>Displays AGENT_MESSAGE bubbles from the backend.</li>
                 <li>Plays WAV bytes streamed after the TTS_AUDIO header.</li>
                 <li>Shows AUDIO_STATS from the backend as audio flows.</li>
-                <li>Displays ASR_FINAL transcripts when VAD segments speech.</li>
-                <li>Applies UI_ACTIONS to navigate, fill fields, and prompt biometric.</li>
+                <li>
+                  Displays ASR_FINAL transcripts when VAD segments speech.
+                </li>
+                <li>
+                  Applies UI_ACTIONS to navigate, fill fields, and prompt
+                  biometric.
+                </li>
               </ul>
               <div className="mt-4 rounded-2xl bg-slate-950/60 p-4 text-xs text-slate-400 ring-1 ring-slate-800">
-                Tip: Run the backend with <code>uvicorn app:app --reload --port 8000</code>{" "}
-                from <code>backend/</code>, then start the frontend via{" "}
+                Tip: Run the backend with{" "}
+                <code>uvicorn app:app --reload --port 8000</code> from{" "}
+                <code>backend/</code>, then start the frontend via{" "}
                 <code>npm run dev</code> in <code>frontend/</code>.
               </div>
             </div>
 
             <div
-              className={`min-h-[160px] rounded-2xl border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-100 transition ${
-                asrFlash ? "ring-2 ring-emerald-400/60" : "ring-1 ring-slate-800"
+              className={`min-h-40 rounded-2xl border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-100 transition ${
+                asrFlash
+                  ? "ring-2 ring-emerald-400/60"
+                  : "ring-1 ring-slate-800"
               }`}
             >
               <div className="flex items-center justify-between">
-                <p className="text-xs uppercase tracking-[0.1em] text-slate-400">
+                <p className="text-xs uppercase tracking-widest text-slate-400">
                   Transcripts
                 </p>
                 {asrFlash && (
