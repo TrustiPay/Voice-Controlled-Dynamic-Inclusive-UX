@@ -77,3 +77,4 @@ MANIFEST.in
 .idea/
 /.venv/
 venv/
+*ledger.json
