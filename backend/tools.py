@@ -1,62 +1,102 @@
 from __future__ import annotations
 
 import json
+import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
-from uuid import uuid4
 
-DATA_DIR = Path(__file__).parent / "data"
-CONTACTS_PATH = DATA_DIR / "contacts.json"
-LEDGER_PATH = DATA_DIR / "ledger.json"
-
-def _read_json(path: Path) -> List[Dict]:
-    if not path.exists():
-        return []
-    return json.loads(path.read_text())
-
-
-def _write_json(path: Path, data: List[Dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
+BASE_DIR = Path(__file__).resolve().parent
+CONTACTS_PATH = BASE_DIR / "data" / "contacts.json"
+LEDGER_PATH = BASE_DIR / "data" / "ledger.json"
 
 
 def load_contacts() -> List[Dict]:
-    return _read_json(CONTACTS_PATH)
+    if not CONTACTS_PATH.exists():
+        return []
+    with CONTACTS_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _normalize(text: str) -> str:
+    text = (text or "").lower().strip()
+    text = re.sub(r"[^a-z0-9+ ]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def search_contact(query: str) -> Optional[Dict]:
-    if not query:
+    """
+    Fuzzy-ish search: substring, token overlap, and prefix scoring.
+    Keeps it deterministic without extra deps.
+    """
+    norm_query = _normalize(query)
+    if not norm_query:
         return None
-    query_norm = query.strip().lower()
+    query_tokens = set(norm_query.split())
+
     best: Optional[Dict] = None
-    for contact in load_contacts():
-        label = contact.get("label", "").lower()
-        if query_norm in label:
-            if best is None or len(label) < len(best.get("label", "")):
-                best = contact
-    return best
+    best_score = 0.0
+
+    for c in load_contacts():
+        label_raw = c.get("label") or ""
+        label = _normalize(label_raw)
+        label_tokens = set(label.split())
+
+        score = 0.0
+        if norm_query in label:
+            score += 3.0
+        if label.startswith(norm_query) or norm_query.startswith(label):
+            score += 1.5
+
+        token_overlap = len(query_tokens & label_tokens)
+        score += token_overlap * 1.0
+
+        # Light phone match support
+        phone = _normalize(c.get("phone") or "")
+        if phone and phone.endswith(norm_query):
+            score += 1.0
+
+        if score > best_score or (score == best_score and best and len(label) < len(_normalize(best.get("label") or ""))):
+            best_score = score
+            best = c
+
+    return best if best_score >= 1.0 else None
+
+
+def append_ledger_entry(entry: Dict) -> None:
+    ledger: List[Dict] = []
+    if LEDGER_PATH.exists():
+        with LEDGER_PATH.open("r", encoding="utf-8") as f:
+            ledger = json.load(f)
+    ledger.append(entry)
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER_PATH.open("w", encoding="utf-8") as f:
+        json.dump(ledger, f, indent=2)
 
 
 def get_ledger() -> List[Dict]:
-    ledger = _read_json(LEDGER_PATH)
-    return list(reversed(ledger))
+    if not LEDGER_PATH.exists():
+        return []
+    with LEDGER_PATH.open("r", encoding="utf-8") as f:
+        items = json.load(f)
+    items = list(items)
+    items.reverse()
+    return items
 
 
-def append_ledger_entry(to_contact_id: str, to_label: str, amount_lkr: int, note: Optional[str]) -> Dict:
-    if amount_lkr <= 0:
-        raise ValueError("Amount must be positive")
-    entry = {
-        "id": f"t_{uuid4().hex[:8]}",
+def make_transfer_entry(
+    to_contact_id: str, to_label: str, amount_lkr: int, note: Optional[str]
+) -> Dict:
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "id": f"t_{uuid.uuid4().hex[:8]}",
         "type": "transfer",
         "to_contact_id": to_contact_id,
         "to_label": to_label,
         "amount_lkr": amount_lkr,
         "note": note,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now,
         "title": f"Sent to {to_label}",
     }
-    ledger = _read_json(LEDGER_PATH)
-    ledger.append(entry)
-    _write_json(LEDGER_PATH, ledger)
-    return entry

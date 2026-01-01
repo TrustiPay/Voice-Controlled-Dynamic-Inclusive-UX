@@ -4,238 +4,380 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # type: ignore
+from fastapi.middleware.cors import CORSMiddleware # type: ignore
+from starlette.websockets import WebSocketState # type: ignore
 
-from agent import (
-    AgentDecision,
-    LlmAgent,
-    ToolCall,
-    apply_state_patch,
-    execute_tool_call,
-    handle_biometric_ok,
-)
 from asr import transcribe_pcm16k
-from state import SessionState
+from heuristics import (
+    detect_transfer_intent,
+    extract_amount,
+    extract_note,
+    extract_recipient_hint,
+    is_affirmative,
+    is_note_request_only,
+    is_skip_note,
+)
+from state import ConversationState
+from tools import (
+    append_ledger_entry,
+    get_ledger,
+    make_transfer_entry,
+    search_contact,
+)
 from tts import synthesize_wav
-from vad import SileroVAD
-
-
-@dataclass
-class WsSession:
-    state: SessionState = field(default_factory=SessionState)
-    audio_config: Dict[str, Any] = field(default_factory=dict)
-    total_audio_bytes: int = 0
-    bytes_since_stats: int = 0
-    last_stats_time: float = field(default_factory=time.monotonic)
-    vad: SileroVAD = field(default_factory=SileroVAD)
-    utterance_count: int = 0
-    stats_interval_bytes: int = 32_000  # ~1 second at 16kHz mono 16-bit
-    messages: list[Dict[str, str]] = field(default_factory=list)
-
-    def record_bytes(self, size: int) -> None:
-        self.total_audio_bytes += size
-        self.bytes_since_stats += size
-
-    def pop_stats(self, sample_rate: int) -> Dict[str, Any] | None:
-        if self.bytes_since_stats < self.stats_interval_bytes:
-            return None
-        total_bytes = self.total_audio_bytes
-        seconds_estimate = total_bytes / 2 / max(sample_rate, 1)
-        self.bytes_since_stats = 0
-        self.last_stats_time = time.monotonic()
-        return {
-            "type": "AUDIO_STATS",
-            "total_bytes": total_bytes,
-            "seconds_estimate": round(seconds_estimate, 2),
-        }
-
-    def add_message(self, role: str, content: str) -> None:
-        if not content:
-            return
-        self.messages.append({"role": role, "content": content})
-        self.messages = self.messages[-8:]
-
-    def recent_messages(self) -> list[Dict[str, str]]:
-        return self.messages[-8:]
+from vad import VADSegmenter
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("trustipay.app")
+logger = logging.getLogger("trustipay.backend")
 
 app = FastAPI(title="TrustiPay Prototype")
-agent = LlmAgent()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
-async def health() -> JSONResponse:
-    return JSONResponse({"ok": True})
+async def health() -> Dict[str, bool]:
+    return {"ok": True}
 
 
-async def _send_greeting(websocket: WebSocket, user_name: str) -> None:
-    text = f"Hello {user_name}, I can help you with that."
-    await websocket.send_json({"type": "AGENT_MESSAGE", "text": text})
-
-    wav_bytes = synthesize_wav(text)
-    await websocket.send_json({"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(wav_bytes)})
-    await websocket.send_bytes(wav_bytes)
-
-
-async def _send_response(websocket: WebSocket, say: str, ui_actions: list[dict[str, Any]] | None = None) -> None:
-    await websocket.send_json({"type": "AGENT_MESSAGE", "text": say})
-    if ui_actions:
-        await websocket.send_json({"type": "UI_ACTIONS", "actions": ui_actions})
-    if say:
-        wav_bytes = synthesize_wav(say)
-        await websocket.send_json({"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(wav_bytes)})
-        await websocket.send_bytes(wav_bytes)
-
-
-def _serialize_actions(actions: list[Any]) -> list[dict[str, Any]]:
-    serialized: list[dict[str, Any]] = []
-    for action in actions:
-        if hasattr(action, "model_dump"):
-            serialized.append(action.model_dump(exclude_none=True))
-        elif isinstance(action, dict):
-            serialized.append({k: v for k, v in action.items() if v is not None})
-    return serialized
+def _build_confirmation(state: ConversationState) -> Tuple[str, List[Dict[str, Any]]]:
+    summary = state.build_summary()
+    state.draft_summary = summary
+    state.pending_transfer = {
+        "to_contact_id": state.recipient_contact_id,
+        "to_label": state.recipient_label,
+        "amount_lkr": state.amount_lkr,
+        "note": state.note,
+    }
+    state.step = "awaiting_biometric"
+    actions = [
+        {"type": "NAVIGATE", "screen": "confirm"},
+        {"type": "SHOW_CONFIRM", "summary": summary},
+        {"type": "PROMPT_BIOMETRIC"},
+    ]
+    say = f"Please confirm: {summary}"
+    return say, actions
 
 
-def _apply_actions_to_state(state: SessionState, actions: list[dict[str, Any]]) -> None:
-    for action in actions:
-        if action.get("type") == "SET_FIELD":
-            field = action.get("field")
-            value = action.get("value")
-            if field == "recipient":
-                state.recipient_label = value
-            elif field == "amount":
-                state.amount_lkr = value
-            elif field == "note":
-                state.note = value
-        if action.get("type") == "PROMPT_BIOMETRIC":
-            state.step = "awaiting_biometric"
+@dataclass
+class SessionState:
+    audio_config: Optional[Dict[str, Any]] = None
+    total_audio_bytes: int = 0
+    last_stats_time: float = field(default_factory=time.time)
+    vad: VADSegmenter = field(default_factory=VADSegmenter)
+    utterance_count: int = 0
+    conversation: ConversationState = field(default_factory=ConversationState)
+
+    def seconds_estimate(self) -> float:
+        cfg = self.audio_config or {}
+        sample_rate = int(cfg.get("sample_rate", 16000) or 16000)
+        channels = int(cfg.get("channels", 1) or 1)
+        bytes_per_frame = 2 * max(1, channels)
+        if sample_rate <= 0 or bytes_per_frame <= 0:
+            return 0.0
+        frames = self.total_audio_bytes / bytes_per_frame
+        return frames / sample_rate
 
 
-async def _process_decision(websocket: WebSocket, session: WsSession, decision: AgentDecision) -> Optional[ToolCall]:
-    apply_state_patch(session.state, decision.state_patch)
-    actions = _serialize_actions(decision.ui_actions)
-    _apply_actions_to_state(session.state, actions)
-    await _send_response(websocket, decision.say, actions)
-    session.add_message("assistant", decision.say)
-    return decision.tool_call
+def _handle_user_text(state: SessionState, text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    conv = state.conversation
+    actions: List[Dict[str, Any]] = []
+    cleaned = text.strip()
+    if not cleaned:
+        return "I didn't catch that. Could you repeat?", actions
 
+    lower = cleaned.lower()
 
-async def _run_decision_flow(
-    websocket: WebSocket,
-    session: WsSession,
-    user_text: Optional[str] = None,
-    last_tool_result: Optional[Dict[str, Any]] = None,
-) -> None:
-    loops = 0
-    decision = agent.decide(session.state, user_text, last_tool_result, session.recent_messages())
-    tool_call = await _process_decision(websocket, session, decision)
-
-    while tool_call and loops < 2:
-        loops += 1
-        try:
-            tool_result = execute_tool_call(session.state, tool_call)
-        except Exception as exc:
-            logger.exception("Tool call failed: %s", exc)
-            tool_result = {"error": "exception", "detail": str(exc)}
-
-        decision = agent.decide(session.state, None, tool_result, session.recent_messages())
-        tool_call = await _process_decision(websocket, session, decision)
-
-
-async def _handle_client_message(
-    websocket: WebSocket,
-    payload: Dict[str, Any],
-    session: WsSession,
-) -> bool:
-    """
-    Returns False if the loop should terminate.
-    """
-    msg_type = payload.get("type")
-    if msg_type == "START_SESSION":
-        user = payload.get("user") or {}
-        user_name = user.get("name", "John")
-        session.state.reset(user_id=user.get("id", "anon"), user_name=user_name, language=payload.get("language", "en"))
-        await _send_greeting(websocket, user_name)
-        return True
-
-    if msg_type == "AUDIO_CONFIG":
-        session.audio_config = payload
-        logger.info("Audio config set: %s", payload)
-        return True
-
-    if msg_type == "BIOMETRIC_RESULT":
-        if payload.get("ok"):
-            response = handle_biometric_ok(session.state)
-            logger.info("Biometric OK -> %s", response["ui_actions"])
-            await _send_response(websocket, response["say"], response["ui_actions"])
+    if conv.step == "idle":
+        if detect_transfer_intent(cleaned):
+            conv.intent = "transfer"
+            conv.step = "collect_recipient"
+            actions.append({"type": "NAVIGATE", "screen": "transfer"})
+            say = f"Sure {conv.user_name}. What is your friend's name as saved in your contacts?"
         else:
-            await _send_response(websocket, "Fingerprint verification failed. Please try again.", [])
-        return True
+            say = "I can help you send money. Say something like: send 4000 rupees to Kevin at work."
+        return say, actions
 
-    if msg_type == "STOP":
-        await websocket.send_json({"type": "END", "reason": "stopped"})
+    if conv.step == "collect_recipient":
+        label_hint = extract_recipient_hint(cleaned) or cleaned
+        contact = search_contact(label_hint)
+        if contact:
+            conv.recipient_label = contact["label"]
+            conv.recipient_contact_id = contact["id"]
+            conv.step = "collect_amount"
+            actions.append(
+                {"type": "SET_FIELD", "field": "recipient", "value": conv.recipient_label}
+            )
+            say = "Thanks. How much would you like to send?"
+        else:
+            say = "I couldn't find that contact. Please say the name exactly as saved."
+        return say, actions
+
+    if conv.step == "collect_amount":
+        amount = extract_amount(cleaned)
+        note = extract_note(cleaned)
+        if amount:
+            conv.amount_lkr = amount
+            actions.append({"type": "SET_FIELD", "field": "amount", "value": amount})
+            if note:
+                conv.pending_note = note
+                actions.append({"type": "SET_FIELD", "field": "note", "value": note})
+                conv.step = "confirm_note"
+                say = f"I heard the note '{note}'. Should I use this note or change it?"
+            else:
+                if is_note_request_only(cleaned):
+                    conv.pending_note = None
+                    conv.step = "collect_note_value"
+                    say = "Sure. What should the note say?"
+                else:
+                    conv.step = "collect_note_optional"
+                    say = "Got it. Do you want to add a note?"
+        else:
+            say = "Please tell me the amount in rupees."
+        return say, actions
+
+    if conv.step == "collect_note_optional":
+        if is_skip_note(lower):
+            conv.note = None
+            conv.pending_note = None
+            say, confirm_actions = _build_confirmation(conv)
+            actions.extend(confirm_actions)
+            return say, actions
+        if is_affirmative(cleaned) or is_note_request_only(cleaned):
+            conv.pending_note = None
+            conv.step = "collect_note_value"
+            say = "Sure. What should the note say?"
+        else:
+            note = extract_note(cleaned) or cleaned
+            note = note.strip()
+            if note:
+                conv.pending_note = note
+                actions.append({"type": "SET_FIELD", "field": "note", "value": note})
+                conv.step = "confirm_note"
+                say = f"I heard the note '{note}'. Should I use this note or change it?"
+            else:
+                say = "Please tell me the note, or say no note."
+        return say, actions
+
+    if conv.step == "collect_note_value":
+        if is_skip_note(lower):
+            conv.note = None
+            conv.pending_note = None
+            say, confirm_actions = _build_confirmation(conv)
+            actions.extend(confirm_actions)
+            return say, actions
+        note = extract_note(cleaned) or cleaned
+        if note:
+            conv.pending_note = note.strip()
+            actions.append({"type": "SET_FIELD", "field": "note", "value": conv.pending_note})
+            conv.step = "confirm_note"
+            say = f"I captured the note '{conv.pending_note}'. Should I use this note or change it?"
+        else:
+            say = "I didn't catch the note. Please say it again, or say no note."
+        return say, actions
+
+    if conv.step == "confirm_note":
+        if is_skip_note(lower):
+            conv.note = None
+            conv.pending_note = None
+            say, confirm_actions = _build_confirmation(conv)
+            actions.extend(confirm_actions)
+            return say, actions
+        if is_affirmative(cleaned):
+            if conv.pending_note:
+                conv.note = conv.pending_note
+            conv.pending_note = None
+            if conv.note:
+                actions.append({"type": "SET_FIELD", "field": "note", "value": conv.note})
+            say, confirm_actions = _build_confirmation(conv)
+            actions.extend(confirm_actions)
+            return say, actions
+
+        # Treat this utterance as a replacement note
+        new_note = extract_note(cleaned) or cleaned
+        if new_note:
+            conv.pending_note = new_note.strip()
+            actions.append({"type": "SET_FIELD", "field": "note", "value": conv.pending_note})
+            say = f"Updated the note to '{conv.pending_note}'. Should I use this note or change it?"
+        else:
+            say = "Please confirm the note, or say it again, or say no note."
+        return say, actions
+
+    if conv.step == "awaiting_biometric":
+        return "Please approve with fingerprint to continue.", actions
+
+    if conv.step == "done":
+        return "This session is completed. Start a new session to continue.", actions
+
+    return "I can help you send money. Say something like send 4000 rupees to Kevin at work.", actions
+
+
+async def _speak_and_act(
+    websocket: WebSocket, text: str, actions: Optional[List[Dict[str, Any]]] = None
+) -> None:
+    if text:
+        await websocket.send_json({"type": "AGENT_MESSAGE", "text": text})
+        audio_bytes = synthesize_wav(text)
+        await websocket.send_json(
+            {"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(audio_bytes)}
+        )
+        await websocket.send_bytes(audio_bytes)
+    if actions:
+        await websocket.send_json({"type": "UI_ACTIONS", "actions": actions})
+
+
+async def _execute_transfer(websocket: WebSocket, session_state: SessionState) -> None:
+    conv = session_state.conversation
+    if (
+        conv.step != "awaiting_biometric"
+        or not conv.recipient_contact_id
+        or not conv.recipient_label
+        or not conv.amount_lkr
+    ):
+        await _speak_and_act(
+            websocket, "I cannot execute the transfer yet. Please complete the details."
+        )
+        return
+
+    entry = make_transfer_entry(
+        conv.recipient_contact_id, conv.recipient_label, conv.amount_lkr, conv.note
+    )
+    append_ledger_entry(entry)
+    ledger_items = get_ledger()
+    conv.step = "done"
+    conv.pending_transfer = None
+
+    actions = [
+        {"type": "NAVIGATE", "screen": "success"},
+        {"type": "SHOW_TOAST", "message": "Payment sent"},
+        {"type": "SHOW_HISTORY", "items": ledger_items},
+    ]
+    message = f"Done. I sent {conv.amount_lkr} LKR to {conv.recipient_label}."
+    await _speak_and_act(websocket, message, actions)
+
+
+async def _handle_start_session(
+    websocket: WebSocket, payload: Dict[str, Any], session_state: SessionState
+) -> None:
+    user = payload.get("user") or {}
+    name = user.get("name") or "John"
+    session_state.conversation.reset()
+    session_state.conversation.user_name = name
+    session_state.conversation.step = "idle"
+    greeting = f"Hello {name}, I can help you with that."
+    logger.info("Sending greeting to %s", name)
+
+    await websocket.send_json({"type": "AGENT_MESSAGE", "text": greeting})
+
+    audio_bytes = synthesize_wav(greeting)
+    await websocket.send_json(
+        {"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(audio_bytes)}
+    )
+    await websocket.send_bytes(audio_bytes)
+
+
+async def _handle_text_message(
+    websocket: WebSocket, text: str, session_state: SessionState
+) -> bool:
+    """Returns True if the websocket should close."""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Received non-JSON text frame: %s", text[:80])
         return False
 
-    return True
+    message_type = payload.get("type")
+    if message_type == "START_SESSION":
+        await _handle_start_session(websocket, payload, session_state)
+    elif message_type == "AUDIO_CONFIG":
+        session_state.audio_config = {
+            "format": payload.get("format"),
+            "sample_rate": payload.get("sample_rate"),
+            "channels": payload.get("channels"),
+        }
+        logger.info("Received AUDIO_CONFIG: %s", session_state.audio_config)
+    elif message_type == "BIOMETRIC_RESULT":
+        ok = bool(payload.get("ok"))
+        if ok:
+            await _execute_transfer(websocket, session_state)
+        else:
+            await _speak_and_act(
+                websocket, "Fingerprint verification failed. Please try again."
+            )
+    elif message_type == "STOP":
+        logger.info("Received STOP from client")
+        final_utts = session_state.vad.flush()
+        for utt in final_utts:
+            transcript = transcribe_pcm16k(utt)
+            await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
+            say, actions = _handle_user_text(session_state, transcript)
+            await _speak_and_act(websocket, say, actions)
+        await websocket.close(code=1000)
+        return True
+    else:
+        logger.info("Unhandled message type %s", message_type)
+
+    return False
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
-    session = WsSession()
+    session_state = SessionState()
+    logger.info("WebSocket connected from %s", websocket.client)
     try:
         while True:
             message = await websocket.receive()
-            if message["type"] == "websocket.disconnect":
+            message_type = message.get("type")
+
+            if message_type == "websocket.disconnect":
+                logger.info("Client disconnected")
                 break
 
-            if message.get("text") is not None:
-                try:
-                    payload = json.loads(message["text"])
-                except json.JSONDecodeError:
-                    logger.warning("Discarding non-JSON text frame: %s", message["text"])
-                    continue
-
-                keep_going = await _handle_client_message(websocket, payload, session)
-                if not keep_going:
+            if "text" in message:
+                should_close = await _handle_text_message(
+                    websocket, message.get("text") or "", session_state
+                )
+                if should_close:
                     break
-            elif message.get("bytes") is not None:
-                chunk = message["bytes"] or b""
-                chunk_len = len(chunk)
-                session.record_bytes(chunk_len)
+            elif "bytes" in message:
+                payload = message.get("bytes") or b""
+                session_state.total_audio_bytes += len(payload)
+                utterances = session_state.vad.accept_bytes(payload)
+                for utt in utterances:
+                    session_state.utterance_count += 1
+                    transcript = transcribe_pcm16k(utt)
+                    await websocket.send_json(
+                        {"type": "ASR_FINAL", "text": transcript}
+                    )
+                    say, actions = _handle_user_text(session_state, transcript)
+                    await _speak_and_act(websocket, say, actions)
 
-                sample_rate = (session.audio_config or {}).get("sample_rate", 16_000)
-                stats_payload = session.pop_stats(sample_rate)
-                if stats_payload:
-                    await websocket.send_json(stats_payload)
-
-                # VAD + ASR
-                try:
-                    utterances = session.vad.accept_bytes(chunk)
-                except Exception as exc:  # safeguard against VAD errors
-                    logger.exception("VAD processing failed: %s", exc)
-                    utterances = []
-
-                for utterance in utterances:
-                    transcript = ""
-                    try:
-                        transcript = transcribe_pcm16k(utterance)
-                    except Exception as exc:
-                        logger.exception("ASR transcription failed: %s", exc)
-                    if transcript:
-                        session.utterance_count += 1
-                        logger.info("ASR_FINAL: %s", transcript)
-                        await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
-                        session.add_message("user", transcript)
-                        await _run_decision_flow(websocket, session, user_text=transcript)
-
+                now = time.time()
+                if now - session_state.last_stats_time >= 1.0:
+                    session_state.last_stats_time = now
+                    await websocket.send_json(
+                        {
+                            "type": "AUDIO_STATS",
+                            "total_bytes": session_state.total_audio_bytes,
+                            "seconds_estimate": round(
+                                session_state.seconds_estimate(), 2
+                            ),
+                        }
+                    )
+            else:
+                logger.info("Ignored websocket frame %s", message_type)
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.info("WebSocket disconnected unexpectedly")
     finally:
-        await websocket.close()
+        if websocket.client_state != WebSocketState.DISCONNECTED:
+            await websocket.close()

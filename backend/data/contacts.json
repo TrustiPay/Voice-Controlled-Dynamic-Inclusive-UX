@@ -1,4 +1,5 @@
 [
   { "id": "c1", "label": "Kevin at work", "phone": "+94771234567" },
-  { "id": "c2", "label": "Amma", "phone": "+94770000000" }
+  { "id": "c2", "label": "Amma", "phone": "+94770000000" },
+  { "id": "c3", "label": "Tharindu office", "phone": "+94779998888" }
 ]

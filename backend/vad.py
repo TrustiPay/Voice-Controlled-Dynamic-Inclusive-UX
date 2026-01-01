@@ -2,113 +2,136 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass
-from typing import Deque, List
+from typing import List, Optional
 
 import numpy as np
 import torch
 
-logger = logging.getLogger(__name__)
-
-_MODEL = None
+logger = logging.getLogger("trustipay.vad")
 
 
-def _load_model():
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = torch.hub.load(repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True)
-    return _MODEL
-
-
-@dataclass
-class VadConfig:
-    sample_rate: int = 16_000
-    frame_size: int = 512  # 32 ms at 16 kHz
-    start_threshold: float = 0.6
-    end_threshold: float = 0.5
-    start_trigger_frames: int = 3
-    end_trigger_frames: int = 20  # ~640 ms
-    pre_roll_ms: int = 300
-    min_utterance_ms: int = 600
-
-
-class SileroVAD:
+class VADSegmenter:
     """
-    Streaming VAD that yields utterance byte chunks using Silero probabilities.
+    Streaming VAD wrapper around Silero to yield utterance byte chunks.
     """
 
-    def __init__(self, config: VadConfig | None = None):
-        self.config = config or VadConfig()
-        self.model = _load_model()
-        self.device = torch.device("cpu")
+    def __init__(
+        self,
+        sample_rate: int = 16_000,
+        frame_ms: int = 32,
+        threshold: float = 0.6,
+        max_silence_ms: int = 800,
+        start_trigger_ms: int = 64,
+        preroll_ms: int = 300,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.window_size = int(sample_rate * frame_ms / 1000)
+        self.threshold = threshold
+        self.max_silence_windows = max(1, int(max_silence_ms / frame_ms))
+        self.start_trigger_windows = max(1, int(start_trigger_ms / frame_ms))
+        self.preroll_max_bytes = int(preroll_ms * sample_rate / 1000) * 2
 
-        frame_ms = (self.config.frame_size / self.config.sample_rate) * 1000
-        self.pre_roll_frames = int(self.config.pre_roll_ms / frame_ms)
-        self.min_utterance_frames = int(self.config.min_utterance_ms / frame_ms)
+        self.model, _utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            trust_repo=True,
+        )
+        self.model.to("cpu")
+        self.model.eval()
 
-        self.pre_frames: Deque[bytes] = deque(maxlen=self.pre_roll_frames)
-        self.current_frames: List[bytes] = []
-        self.speech_run = 0
-        self.silence_run = 0
-        self.in_speech = False
+        self._float_buffer: np.ndarray = np.array([], dtype=np.float32)
+        self._raw_buffer: bytearray = bytearray()
+        self._preroll: deque[bytes] = deque()
+        self._speech_active = False
+        self._start_buildup = 0
+        self._silence_windows = 0
+        self._current_raw: bytearray = bytearray()
 
-    def _frame_prob(self, frame_float: np.ndarray) -> float:
-        if frame_float.size == 0:
-            return 0.0
-        with torch.no_grad():
-            tensor = torch.from_numpy(frame_float).to(self.device)
-            prob = float(self.model(tensor, self.config.sample_rate).item())
-        return prob
+        logger.info(
+            "Initialized VADSegmenter (frame_ms=%s, threshold=%.2f)",
+            frame_ms,
+            threshold,
+        )
+
+    def _append_preroll(self, raw_bytes: bytes) -> None:
+        self._preroll.append(raw_bytes)
+        while sum(len(chunk) for chunk in self._preroll) > self.preroll_max_bytes:
+            self._preroll.popleft()
+
+    def _consume_raw_window(self) -> Optional[bytes]:
+        needed = self.window_size * 2
+        if len(self._raw_buffer) < needed:
+            return None
+        window = bytes(self._raw_buffer[:needed])
+        del self._raw_buffer[:needed]
+        return window
 
     def accept_bytes(self, pcm_bytes: bytes) -> List[bytes]:
         """
-        Feed raw PCM (s16le, 16 kHz, mono) bytes. Returns a list of completed utterance byte buffers.
+        Feed pcm_s16le bytes, return a list of completed utterance byte buffers.
         """
-        utterances: List[bytes] = []
         if not pcm_bytes:
-            return utterances
+            return []
 
-        pcm_samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-        total_frames = int(np.ceil(len(pcm_samples) / self.config.frame_size))
+        self._raw_buffer.extend(pcm_bytes)
+        pcm_chunk = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if self._float_buffer.size == 0:
+            self._float_buffer = pcm_chunk
+        else:
+            self._float_buffer = np.concatenate([self._float_buffer, pcm_chunk])
 
-        for idx in range(total_frames):
-            start = idx * self.config.frame_size
-            end = start + self.config.frame_size
-            frame_pcm = pcm_samples[start:end]
-            if frame_pcm.size < self.config.frame_size:
-                frame_pcm = np.pad(frame_pcm, (0, self.config.frame_size - frame_pcm.size))
+        utterances: List[bytes] = []
 
-            frame_bytes = frame_pcm.tobytes()
-            frame_float = frame_pcm.astype(np.float32) / 32768.0
-            prob = self._frame_prob(frame_float)
+        while self._float_buffer.shape[0] >= self.window_size:
+            window_f = self._float_buffer[: self.window_size]
+            self._float_buffer = self._float_buffer[self.window_size :]
 
-            if not self.in_speech:
-                self.pre_frames.append(frame_bytes)
-                if prob >= self.config.start_threshold:
-                    self.speech_run += 1
-                    if self.speech_run >= self.config.start_trigger_frames:
-                        self.in_speech = True
-                        self.current_frames = list(self.pre_frames)
-                        self.current_frames.append(frame_bytes)
-                        self.silence_run = 0
+            raw_window = self._consume_raw_window()
+            if raw_window is None:
+                break
+
+            window_t = torch.from_numpy(window_f)
+            with torch.no_grad():
+                prob = float(self.model(window_t, self.sample_rate))
+
+            if not self._speech_active:
+                self._append_preroll(raw_window)
+                if prob > self.threshold:
+                    self._start_buildup += 1
                 else:
-                    self.speech_run = 0
-                continue
+                    self._start_buildup = 0
 
-            # In speech
-            self.current_frames.append(frame_bytes)
-            if prob < self.config.end_threshold:
-                self.silence_run += 1
-                if self.silence_run >= self.config.end_trigger_frames:
-                    if len(self.current_frames) >= self.min_utterance_frames:
-                        utterances.append(b"".join(self.current_frames))
-                        logger.debug("Completed utterance with %s frames", len(self.current_frames))
-                    self.in_speech = False
-                    self.speech_run = 0
-                    self.silence_run = 0
-                    self.current_frames = []
-                    self.pre_frames.clear()
+                if self._start_buildup >= self.start_trigger_windows:
+                    self._speech_active = True
+                    self._silence_windows = 0
+                    self._current_raw = bytearray(b"".join(self._preroll))
+                    self._current_raw.extend(raw_window)
+                    self._preroll.clear()
             else:
-                self.silence_run = 0
+                self._current_raw.extend(raw_window)
+                if prob > self.threshold:
+                    self._silence_windows = 0
+                else:
+                    self._silence_windows += 1
+                    if self._silence_windows >= self.max_silence_windows:
+                        utterances.append(bytes(self._current_raw))
+                        self._speech_active = False
+                        self._current_raw = bytearray()
+                        self._start_buildup = 0
+                        self._silence_windows = 0
 
         return utterances
+
+    def flush(self) -> List[bytes]:
+        """
+        Emit any buffered speech on teardown.
+        """
+        if self._speech_active and self._current_raw:
+            utterance = bytes(self._current_raw)
+            self._speech_active = False
+            self._current_raw = bytearray()
+            self._start_buildup = 0
+            self._silence_windows = 0
+            return [utterance]
+        return []
