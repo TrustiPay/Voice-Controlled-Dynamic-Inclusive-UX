@@ -3,3 +3,4 @@ uvicorn[standard]
 numpy
 torch
 faster-whisper
+torchaudio
