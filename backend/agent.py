@@ -5,7 +5,7 @@ import logging
 from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_community.chat_models import ChatOllama
+from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from state import ConversationState
