@@ -4,29 +4,16 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # type: ignore
-from fastapi.middleware.cors import CORSMiddleware # type: ignore
-from starlette.websockets import WebSocketState # type: ignore
+from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+from starlette.websockets import WebSocketState  # type: ignore
 
+from agent import AgentDecision, agent
 from asr import transcribe_pcm16k
-from heuristics import (
-    detect_transfer_intent,
-    extract_amount,
-    extract_note,
-    extract_recipient_hint,
-    is_affirmative,
-    is_note_request_only,
-    is_skip_note,
-)
 from state import ConversationState
-from tools import (
-    append_ledger_entry,
-    get_ledger,
-    make_transfer_entry,
-    search_contact,
-)
+from tools import append_ledger_entry, get_ledger, make_transfer_entry, search_contact
 from tts import synthesize_wav
 from vad import VADSegmenter
 
@@ -49,25 +36,6 @@ async def health() -> Dict[str, bool]:
     return {"ok": True}
 
 
-def _build_confirmation(state: ConversationState) -> Tuple[str, List[Dict[str, Any]]]:
-    summary = state.build_summary()
-    state.draft_summary = summary
-    state.pending_transfer = {
-        "to_contact_id": state.recipient_contact_id,
-        "to_label": state.recipient_label,
-        "amount_lkr": state.amount_lkr,
-        "note": state.note,
-    }
-    state.step = "awaiting_biometric"
-    actions = [
-        {"type": "NAVIGATE", "screen": "confirm"},
-        {"type": "SHOW_CONFIRM", "summary": summary},
-        {"type": "PROMPT_BIOMETRIC"},
-    ]
-    say = f"Please confirm: {summary}"
-    return say, actions
-
-
 @dataclass
 class SessionState:
     audio_config: Optional[Dict[str, Any]] = None
@@ -76,6 +44,8 @@ class SessionState:
     vad: VADSegmenter = field(default_factory=VADSegmenter)
     utterance_count: int = 0
     conversation: ConversationState = field(default_factory=ConversationState)
+    history: List[Dict[str, str]] = field(default_factory=list)
+    last_tool_result: Optional[Dict[str, Any]] = None
 
     def seconds_estimate(self) -> float:
         cfg = self.audio_config or {}
@@ -88,137 +58,107 @@ class SessionState:
         return frames / sample_rate
 
 
-def _handle_user_text(state: SessionState, text: str) -> Tuple[str, List[Dict[str, Any]]]:
-    conv = state.conversation
-    actions: List[Dict[str, Any]] = []
-    cleaned = text.strip()
-    if not cleaned:
-        return "I didn't catch that. Could you repeat?", actions
+ALLOWED_PATCH_FIELDS = {
+    "recipient_label",
+    "recipient_contact_id",
+    "amount_lkr",
+    "note",
+    "pending_note",
+    "intent",
+    "step",
+}
 
-    lower = cleaned.lower()
 
-    if conv.step == "idle":
-        if detect_transfer_intent(cleaned):
-            conv.intent = "transfer"
-            conv.step = "collect_recipient"
-            actions.append({"type": "NAVIGATE", "screen": "transfer"})
-            say = f"Sure {conv.user_name}. What is your friend's name as saved in your contacts?"
-        else:
-            say = "I can help you send money. Say something like: send 4000 rupees to Kevin at work."
-        return say, actions
+def _apply_state_patch(conv: ConversationState, patch: Optional[Dict[str, Any]]) -> None:
+    if not patch:
+        return
+    for key, value in patch.items():
+        if key in ALLOWED_PATCH_FIELDS:
+            setattr(conv, key, value)
 
-    if conv.step == "collect_recipient":
-        label_hint = extract_recipient_hint(cleaned) or cleaned
-        contact = search_contact(label_hint)
-        if contact:
-            conv.recipient_label = contact["label"]
-            conv.recipient_contact_id = contact["id"]
-            conv.step = "collect_amount"
-            actions.append(
-                {"type": "SET_FIELD", "field": "recipient", "value": conv.recipient_label}
-            )
-            say = "Thanks. How much would you like to send?"
-        else:
-            say = "I couldn't find that contact. Please say the name exactly as saved."
-        return say, actions
 
-    if conv.step == "collect_amount":
-        amount = extract_amount(cleaned)
-        note = extract_note(cleaned)
-        if amount:
-            conv.amount_lkr = amount
-            actions.append({"type": "SET_FIELD", "field": "amount", "value": amount})
-            if note:
-                conv.pending_note = note
-                actions.append({"type": "SET_FIELD", "field": "note", "value": note})
-                conv.step = "confirm_note"
-                say = f"I heard the note '{note}'. Should I use this note or change it?"
-            else:
-                if is_note_request_only(cleaned):
-                    conv.pending_note = None
-                    conv.step = "collect_note_value"
-                    say = "Sure. What should the note say?"
-                else:
-                    conv.step = "collect_note_optional"
-                    say = "Got it. Do you want to add a note?"
-        else:
-            say = "Please tell me the amount in rupees."
-        return say, actions
-
-    if conv.step == "collect_note_optional":
-        if is_skip_note(lower):
-            conv.note = None
-            conv.pending_note = None
-            say, confirm_actions = _build_confirmation(conv)
-            actions.extend(confirm_actions)
-            return say, actions
-        if is_affirmative(cleaned) or is_note_request_only(cleaned):
-            conv.pending_note = None
-            conv.step = "collect_note_value"
-            say = "Sure. What should the note say?"
-        else:
-            note = extract_note(cleaned) or cleaned
-            note = note.strip()
-            if note:
-                conv.pending_note = note
-                actions.append({"type": "SET_FIELD", "field": "note", "value": note})
-                conv.step = "confirm_note"
-                say = f"I heard the note '{note}'. Should I use this note or change it?"
-            else:
-                say = "Please tell me the note, or say no note."
-        return say, actions
-
-    if conv.step == "collect_note_value":
-        if is_skip_note(lower):
-            conv.note = None
-            conv.pending_note = None
-            say, confirm_actions = _build_confirmation(conv)
-            actions.extend(confirm_actions)
-            return say, actions
-        note = extract_note(cleaned) or cleaned
+def _run_tool_call(tool_call: Dict[str, Any], session_state: SessionState) -> Dict[str, Any]:
+    name = tool_call.get("name")
+    args = tool_call.get("args") or {}
+    conv = session_state.conversation
+    if name == "search_contact":
+        query = args.get("query") or args.get("label") or ""
+        result = search_contact(query)
+        return {"tool": "search_contact", "query": query, "result": result}
+    if name == "get_history":
+        return {"tool": "get_history", "items": get_ledger()}
+    if name == "prepare_transfer":
+        contact_id = args.get("contact_id") or conv.recipient_contact_id
+        amount = args.get("amount_lkr") or conv.amount_lkr
+        note = args.get("note") or conv.note
+        if not contact_id or not amount:
+            return {"tool": "prepare_transfer", "error": "missing contact or amount"}
+        conv.recipient_contact_id = contact_id
+        conv.amount_lkr = int(amount)
+        if "recipient_label" in args:
+            conv.recipient_label = args.get("recipient_label")
         if note:
-            conv.pending_note = note.strip()
-            actions.append({"type": "SET_FIELD", "field": "note", "value": conv.pending_note})
-            conv.step = "confirm_note"
-            say = f"I captured the note '{conv.pending_note}'. Should I use this note or change it?"
-        else:
-            say = "I didn't catch the note. Please say it again, or say no note."
-        return say, actions
+            conv.note = note
+        conv.pending_transfer = {
+            "to_contact_id": conv.recipient_contact_id,
+            "to_label": conv.recipient_label,
+            "amount_lkr": conv.amount_lkr,
+            "note": conv.note,
+        }
+        conv.step = "awaiting_biometric"
+        summary = conv.build_summary()
+        conv.draft_summary = summary
+        return {"tool": "prepare_transfer", "summary": summary}
+    if name == "execute_transfer":
+        return {"tool": "execute_transfer", "error": "biometric_required"}
+    return {"error": f"unknown_tool_{name}"}
 
-    if conv.step == "confirm_note":
-        if is_skip_note(lower):
-            conv.note = None
-            conv.pending_note = None
-            say, confirm_actions = _build_confirmation(conv)
-            actions.extend(confirm_actions)
-            return say, actions
-        if is_affirmative(cleaned):
-            if conv.pending_note:
-                conv.note = conv.pending_note
-            conv.pending_note = None
-            if conv.note:
-                actions.append({"type": "SET_FIELD", "field": "note", "value": conv.note})
-            say, confirm_actions = _build_confirmation(conv)
-            actions.extend(confirm_actions)
-            return say, actions
 
-        # Treat this utterance as a replacement note
-        new_note = extract_note(cleaned) or cleaned
-        if new_note:
-            conv.pending_note = new_note.strip()
-            actions.append({"type": "SET_FIELD", "field": "note", "value": conv.pending_note})
-            say = f"Updated the note to '{conv.pending_note}'. Should I use this note or change it?"
-        else:
-            say = "Please confirm the note, or say it again, or say no note."
-        return say, actions
+async def _process_agent_decision(
+    websocket: WebSocket,
+    session_state: SessionState,
+    decision: AgentDecision,
+    loop_depth: int = 0,
+) -> None:
+    conv = session_state.conversation
+    _apply_state_patch(conv, decision.state_patch)
 
-    if conv.step == "awaiting_biometric":
-        return "Please approve with fingerprint to continue.", actions
+    if decision.ui_actions:
+        await websocket.send_json(
+            {"type": "UI_ACTIONS", "actions": [a.dict(exclude_none=True) for a in decision.ui_actions]}
+        )
 
-    if conv.step == "done":
-        return "This session is completed. Start a new session to continue.", actions
+    if decision.say:
+        await websocket.send_json({"type": "AGENT_MESSAGE", "text": decision.say})
+        audio_bytes = synthesize_wav(decision.say)
+        await websocket.send_json(
+            {"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(audio_bytes)}
+        )
+        await websocket.send_bytes(audio_bytes)
+        session_state.history.append({"role": "assistant", "content": decision.say})
 
-    return "I can help you send money. Say something like send 4000 rupees to Kevin at work.", actions
+    if decision.tool_call and loop_depth < 2:
+        result = _run_tool_call(decision.tool_call.dict(), session_state)
+        session_state.last_tool_result = result
+        follow_up = agent.decide(
+            session_state.conversation, user_text=None, last_tool=result, history=session_state.history
+        )
+        await _process_agent_decision(websocket, session_state, follow_up, loop_depth + 1)
+    else:
+        session_state.last_tool_result = None
+
+
+async def _handle_user_utterance(
+    websocket: WebSocket, session_state: SessionState, transcript: str
+) -> None:
+    session_state.history.append({"role": "user", "content": transcript})
+    decision = agent.decide(
+        session_state.conversation,
+        user_text=transcript,
+        last_tool=session_state.last_tool_result,
+        history=session_state.history,
+    )
+    await _process_agent_decision(websocket, session_state, decision)
 
 
 async def _speak_and_act(
@@ -273,6 +213,8 @@ async def _handle_start_session(
     session_state.conversation.reset()
     session_state.conversation.user_name = name
     session_state.conversation.step = "idle"
+    session_state.history.clear()
+    session_state.last_tool_result = None
     greeting = f"Hello {name}, I can help you with that."
     logger.info("Sending greeting to %s", name)
 
@@ -319,8 +261,7 @@ async def _handle_text_message(
         for utt in final_utts:
             transcript = transcribe_pcm16k(utt)
             await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
-            say, actions = _handle_user_text(session_state, transcript)
-            await _speak_and_act(websocket, say, actions)
+            await _handle_user_utterance(websocket, session_state, transcript)
         await websocket.close(code=1000)
         return True
     else:
@@ -359,8 +300,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_json(
                         {"type": "ASR_FINAL", "text": transcript}
                     )
-                    say, actions = _handle_user_text(session_state, transcript)
-                    await _speak_and_act(websocket, say, actions)
+                    await _handle_user_utterance(websocket, session_state, transcript)
 
                 now = time.time()
                 if now - session_state.last_stats_time >= 1.0:

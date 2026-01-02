@@ -4,3 +4,6 @@ numpy
 torch
 faster-whisper
 torchaudio
+langchain
+langchain-community
+pydantic
