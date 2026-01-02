@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_community.chat_models import ChatOllama
-from pydantic import BaseModel, Field, ValidationError, root_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from state import ConversationState
 
@@ -29,20 +29,19 @@ class UIAction(BaseModel):
     message: Optional[str] = None
     items: Optional[List[Dict[str, Any]]] = None
 
-    @root_validator
-    def validate_action(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        action_type = values.get("type")
-        if action_type == "NAVIGATE" and not values.get("screen"):
+    @model_validator(mode="after")
+    def validate_action(self) -> "UIAction":
+        if self.type == "NAVIGATE" and not self.screen:
             raise ValueError("NAVIGATE requires screen")
-        if action_type == "SET_FIELD" and not values.get("field"):
+        if self.type == "SET_FIELD" and not self.field:
             raise ValueError("SET_FIELD requires field")
-        if action_type == "SHOW_CONFIRM" and not values.get("summary"):
+        if self.type == "SHOW_CONFIRM" and not self.summary:
             raise ValueError("SHOW_CONFIRM requires summary")
-        if action_type == "SHOW_TOAST" and not values.get("message"):
+        if self.type == "SHOW_TOAST" and not self.message:
             raise ValueError("SHOW_TOAST requires message")
-        if action_type == "SHOW_HISTORY" and values.get("items") is None:
+        if self.type == "SHOW_HISTORY" and self.items is None:
             raise ValueError("SHOW_HISTORY requires items")
-        return values
+        return self
 
 
 class ToolCall(BaseModel):
