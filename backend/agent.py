@@ -105,7 +105,8 @@ Draft summary: {state.draft_summary}
         history: List[Dict[str, str]],
     ) -> AgentDecision:
         messages = self._prompt(state, user_text, last_tool, history)
-        raw = self.llm(messages).content
+        response = self.llm.invoke(messages)
+        raw = response.content
         decision = self._parse_decision(raw)
         return decision
 
