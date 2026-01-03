@@ -262,7 +262,6 @@ async def _handle_text_message(
             transcript = transcribe_pcm16k(utt)
             await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
             await _handle_user_utterance(websocket, session_state, transcript)
-        await websocket.close(code=1000)
         return True
     else:
         logger.info("Unhandled message type %s", message_type)
@@ -320,4 +319,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         logger.info("WebSocket disconnected unexpectedly")
     finally:
         if websocket.client_state != WebSocketState.DISCONNECTED:
-            await websocket.close()
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass

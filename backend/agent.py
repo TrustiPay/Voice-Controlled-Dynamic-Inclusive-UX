@@ -64,17 +64,20 @@ class AgentDecision(BaseModel):
 
 class TrustiAgent:
     def __init__(self, model: str = "mistral") -> None:
-        self.llm = ChatOllama(model=model, temperature=0.2)
+        # format="json" nudges Ollama to emit strict JSON
+        self.llm = ChatOllama(model=model, temperature=0.2, format="json")
 
     def _prompt(self, state: ConversationState, user_text: Optional[str], last_tool: Optional[Dict[str, Any]], history: List[Dict[str, str]]) -> List[Any]:
         system_rules = """
 You are the TrustiPay voice assistant.
-Respond ONLY with valid JSON that matches this shape:
-{"say":"string","ui_actions":[...],"tool_call":{"name": "...","args": {...}} | null,"state_patch": {...} | null,"end_session": false}
-No markdown, no prose outside JSON.
-UI actions allowed: NAVIGATE(screen in [home,transfer,confirm,success,history]), SET_FIELD(field in [recipient,amount,note], value), SHOW_CONFIRM(summary), PROMPT_BIOMETRIC, SHOW_TOAST(message), SHOW_HISTORY(items).
-Tools allowed: search_contact(query), prepare_transfer(contact_id, amount_lkr, note), get_history(), execute_transfer(draft_id).
-Safety: never execute transfer without biometric approval; do not invent contacts; ask for missing info one step at a time; require a confirm summary before prompting biometric; keep messages concise.
+Respond ONLY with valid JSON matching this exact schema:
+{"say":"string","ui_actions":[{"type":"NAVIGATE","screen":"home|transfer|confirm|success|history"} | {"type":"SET_FIELD","field":"recipient|amount|note","value":...} | {"type":"SHOW_CONFIRM","summary":...} | {"type":"PROMPT_BIOMETRIC"} | {"type":"SHOW_TOAST","message":...} | {"type":"SHOW_HISTORY","items":[...] }], "tool_call":{"name":"search_contact|prepare_transfer|get_history|execute_transfer","args":{...}} | null, "state_patch":{...} | null, "end_session":false}
+No markdown, no extra text, no comments. Always include keys even if null.
+Examples:
+{"say":"Sure John, who should I send to?","ui_actions":[{"type":"NAVIGATE","screen":"transfer"}],"tool_call":null,"state_patch":{"step":"collect_recipient"},"end_session":false}
+{"say":"Found Kevin at work. How much?","ui_actions":[{"type":"SET_FIELD","field":"recipient","value":"Kevin at work"}],"tool_call":{"name":"search_contact","args":{"query":"Kevin at work"}},"state_patch":{"recipient_label":"Kevin at work"},"end_session":false}
+Allowed tools: search_contact(query), prepare_transfer(contact_id, amount_lkr, note), get_history(), execute_transfer(draft_id).
+Safety: never execute transfer without biometric approval; do not invent contacts; ask for missing info one step at a time; require confirmation summary before biometric; keep replies concise.
 """
         ctx = f"""
 User name: {state.user_name}
@@ -130,7 +133,10 @@ Draft summary: {state.draft_summary}
                 return parsed
 
         logger.warning("Falling back due to unparseable agent output: %s", raw)
-        return AgentDecision(say="Sorry, I didn't get that. Could you repeat?", ui_actions=[])
+        return AgentDecision(
+            say="Sorry, I didn't get that. Please say the recipient and amount, for example 'send 4000 to Kevin at work'.",
+            ui_actions=[],
+        )
 
 
 agent = TrustiAgent()
