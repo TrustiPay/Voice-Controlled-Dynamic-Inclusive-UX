@@ -16,6 +16,8 @@ class ConversationState:
     draft_summary: Optional[str] = None
     pending_transfer: Optional[Dict] = None
     user_name: str = "John"
+    draft_id: Optional[str] = None
+    awaiting_biometric: bool = False
 
     def reset(self) -> None:
         self.step = "idle"
@@ -27,9 +29,13 @@ class ConversationState:
         self.pending_note = None
         self.draft_summary = None
         self.pending_transfer = None
+        self.draft_id = None
+        self.awaiting_biometric = False
 
     def build_summary(self) -> str:
-        summary = f"Send {self.amount_lkr} LKR to {self.recipient_label}"
+        amount = f"{self.amount_lkr} LKR" if self.amount_lkr is not None else "an amount"
+        recipient = self.recipient_label or "the contact"
+        summary = f"Send {amount} to {recipient}"
         if self.note:
             summary += f" with note '{self.note}'"
-        return summary + ". Approve with fingerprint to continue."
+        return summary + "."

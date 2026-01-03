@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -66,6 +67,9 @@ ALLOWED_PATCH_FIELDS = {
     "pending_note",
     "intent",
     "step",
+    "draft_summary",
+    "draft_id",
+    "awaiting_biometric",
 }
 
 
@@ -88,17 +92,17 @@ def _run_tool_call(tool_call: Dict[str, Any], session_state: SessionState) -> Di
     if name == "get_history":
         return {"tool": "get_history", "items": get_ledger()}
     if name == "prepare_transfer":
-        contact_id = args.get("contact_id") or conv.recipient_contact_id
-        amount = args.get("amount_lkr") or conv.amount_lkr
-        note = args.get("note") or conv.note
-        if not contact_id or not amount:
-            return {"tool": "prepare_transfer", "error": "missing contact or amount"}
-        conv.recipient_contact_id = contact_id
-        conv.amount_lkr = int(amount)
-        if "recipient_label" in args:
+        contact_id = conv.recipient_contact_id
+        amount = conv.amount_lkr
+        if args.get("recipient_label"):
             conv.recipient_label = args.get("recipient_label")
-        if note:
-            conv.note = note
+        if args.get("note") and not conv.note:
+            conv.note = args.get("note")
+        if not contact_id or amount is None:
+            return {"tool": "prepare_transfer", "error": "missing contact or amount"}
+        conv.amount_lkr = int(amount)
+        conv.awaiting_biometric = True
+        conv.draft_id = conv.draft_id or f"draft_{uuid.uuid4().hex[:8]}"
         conv.pending_transfer = {
             "to_contact_id": conv.recipient_contact_id,
             "to_label": conv.recipient_label,
@@ -108,7 +112,11 @@ def _run_tool_call(tool_call: Dict[str, Any], session_state: SessionState) -> Di
         conv.step = "awaiting_biometric"
         summary = conv.build_summary()
         conv.draft_summary = summary
-        return {"tool": "prepare_transfer", "summary": summary}
+        return {
+            "tool": "prepare_transfer",
+            "summary": summary,
+            "draft_id": conv.draft_id,
+        }
     if name == "execute_transfer":
         return {"tool": "execute_transfer", "error": "biometric_required"}
     return {"error": f"unknown_tool_{name}"}
@@ -179,9 +187,10 @@ async def _execute_transfer(websocket: WebSocket, session_state: SessionState) -
     conv = session_state.conversation
     if (
         conv.step != "awaiting_biometric"
+        or not conv.awaiting_biometric
         or not conv.recipient_contact_id
         or not conv.recipient_label
-        or not conv.amount_lkr
+        or conv.amount_lkr is None
     ):
         await _speak_and_act(
             websocket, "I cannot execute the transfer yet. Please complete the details."
@@ -195,6 +204,9 @@ async def _execute_transfer(websocket: WebSocket, session_state: SessionState) -
     ledger_items = get_ledger()
     conv.step = "done"
     conv.pending_transfer = None
+    conv.awaiting_biometric = False
+    conv.draft_id = None
+    conv.draft_summary = None
 
     actions = [
         {"type": "NAVIGATE", "screen": "success"},
@@ -288,6 +300,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     websocket, message.get("text") or "", session_state
                 )
                 if should_close:
+                    try:
+                        await websocket.send_json({"type": "END", "reason": "stopped"})
+                    except RuntimeError:
+                        pass
                     break
             elif "bytes" in message:
                 payload = message.get("bytes") or b""
