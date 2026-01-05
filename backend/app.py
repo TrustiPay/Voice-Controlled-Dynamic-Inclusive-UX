@@ -285,6 +285,7 @@ async def _handle_text_message(
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     session_state = SessionState()
+    closing = False
     logger.info("WebSocket connected from %s", websocket.client)
     try:
         while True:
@@ -300,10 +301,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     websocket, message.get("text") or "", session_state
                 )
                 if should_close:
-                    try:
-                        await websocket.send_json({"type": "END", "reason": "stopped"})
-                    except RuntimeError:
-                        pass
+                    closing = True
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        try:
+                            await websocket.send_json(
+                                {"type": "END", "reason": "stopped"}
+                            )
+                        except RuntimeError:
+                            pass
                     break
             elif "bytes" in message:
                 payload = message.get("bytes") or b""
@@ -334,7 +339,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected unexpectedly")
     finally:
-        if websocket.client_state != WebSocketState.DISCONNECTED:
+        if websocket.client_state != WebSocketState.DISCONNECTED and not closing:
             try:
                 await websocket.close()
             except RuntimeError:

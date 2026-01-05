@@ -100,7 +100,7 @@ class TrustiAgent:
         # Repair-only formatter to salvage near-miss JSON
         self.repair_llm = ChatOllama(
             model=model,
-            temperature=0.0,
+            temperature=0.1,
             top_p=0.2,
             repeat_penalty=1.15,
             format="json",
@@ -168,18 +168,19 @@ Otherwise, stick to the schema and avoid extra keys or comments.
         repaired = self.repair_llm.invoke(messages).content
         return self._parse_extraction(repaired)
 
-    def _extract_slots(
-        self, state: ConversationState, user_text: str
-    ) -> ExtractedSlots:
+    def extract_slots(self, state: ConversationState, user_text: str) -> ExtractedSlots:
         messages = self._build_extractor_messages(state, user_text)
         response = self.extractor.invoke(messages)
         raw = response.content
+
         parsed = self._parse_extraction(raw)
         if parsed:
             return parsed
+
         repaired = self._repair_extraction(raw)
         if repaired:
             return repaired
+
         logger.warning("Falling back due to unparseable extractor output: %s", raw)
         return ExtractedSlots()
 
@@ -443,6 +444,21 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             state_patch=state_patch or None,
         )
 
+    def plan_next(
+        self,
+        state: ConversationState,
+        slots: Optional[ExtractedSlots],
+        tool_result: Optional[Dict[str, Any]],
+        user_text: Optional[str] = None,
+    ) -> AgentDecision:
+        if tool_result:
+            return self._respond_to_tool_result(state, tool_result)
+
+        if slots and slots.intent == "history":
+            return self._plan_history(state, slots)
+
+        return self._plan_transfer(state, slots, user_text)
+
     def decide(
         self,
         state: ConversationState,
@@ -450,17 +466,11 @@ Otherwise, stick to the schema and avoid extra keys or comments.
         last_tool: Optional[Dict[str, Any]],
         history: List[Dict[str, str]],
     ) -> AgentDecision:
-        if last_tool:
-            return self._respond_to_tool_result(state, last_tool)
-
         slots: Optional[ExtractedSlots] = None
         if user_text:
-            slots = self._extract_slots(state, user_text)
+            slots = self.extract_slots(state, user_text)
 
-        if slots and slots.intent == "history":
-            return self._plan_history(state, slots)
-
-        return self._plan_transfer(state, slots, user_text)
+        return self.plan_next(state, slots, last_tool, user_text)
 
 
 agent = TrustiAgent()
