@@ -1,1 +1,5 @@
 AGENTS.md
+
+# Ignore local ML models
+backend/models/
+

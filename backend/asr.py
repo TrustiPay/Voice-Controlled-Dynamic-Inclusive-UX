@@ -5,8 +5,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List
 
-import numpy as np
-from faster_whisper import WhisperModel
+import numpy as np # type: ignore
+from faster_whisper import WhisperModel # type: ignore
 
 logger = logging.getLogger("trustipay.asr")
 
