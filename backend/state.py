@@ -15,7 +15,7 @@ class ConversationState:
     pending_note: Optional[str] = None
     draft_summary: Optional[str] = None
     pending_transfer: Optional[Dict] = None
-    user_name: str = "John"
+    user_name: str = "Chinthana"
     draft_id: Optional[str] = None
     awaiting_biometric: bool = False
 

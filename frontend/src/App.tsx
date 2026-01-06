@@ -4,8 +4,9 @@ import { playWavBytes } from "./voice/audio";
 import { startMicStreaming } from "./voice/mic";
 import "./index.css";
 
-type AssistantMessage = {
+type ChatMessage = {
   id: number;
+  role: "assistant" | "user";
   text: string;
 };
 
@@ -30,16 +31,12 @@ function StatusBadge({ label }: { label: string }) {
 
 export default function App() {
   const [status, setStatus] = useState("Disconnected");
-  const [assistantMessages, setAssistantMessages] = useState<
-    AssistantMessage[]
-  >([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [audioStatus, setAudioStatus] = useState("Idle");
   const [hasStarted, setHasStarted] = useState(false);
   const [micStatus, setMicStatus] = useState("Idle");
   const [audioBytes, setAudioBytes] = useState(0);
   const [audioSeconds, setAudioSeconds] = useState(0);
-  const [transcripts, setTranscripts] = useState<string[]>([]);
-  const [asrFlash, setAsrFlash] = useState(false);
   const [screen, setScreen] = useState<Screen>("home");
   const [recipientField, setRecipientField] = useState("");
   const [amountField, setAmountField] = useState("");
@@ -51,12 +48,31 @@ export default function App() {
   const expectingAudio = useRef(false);
   const wsRef = useRef<WebSocket | null>(null);
   const stopMicRef = useRef<(() => void) | null>(null);
+  const autoCloseTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
+      if (autoCloseTimerRef.current) {
+        clearTimeout(autoCloseTimerRef.current);
+        autoCloseTimerRef.current = null;
+      }
       wsRef.current?.close(1000, "component unmounted");
     };
   }, []);
+
+  const clearAutoCloseTimer = () => {
+    if (autoCloseTimerRef.current) {
+      clearTimeout(autoCloseTimerRef.current);
+      autoCloseTimerRef.current = null;
+    }
+  };
+
+  const scheduleAutoClose = () => {
+    clearAutoCloseTimer();
+    autoCloseTimerRef.current = window.setTimeout(() => {
+      sendStopAndCleanup();
+    }, 1000);
+  };
 
   const applyUiActions = (actions: any[]) => {
     if (!actions || !Array.isArray(actions)) return;
@@ -68,6 +84,7 @@ export default function App() {
           }
           if (action.screen === "success") {
             setBiometricPrompt(false);
+            scheduleAutoClose();
           }
           break;
         case "SET_FIELD":
@@ -117,7 +134,7 @@ export default function App() {
     () => [
       "Press Start to begin a voice session.",
       "You should hear a short greeting clip.",
-      "Messages from the assistant will show up here.",
+      "Your conversation will show up here.",
     ],
     []
   );
@@ -229,6 +246,7 @@ export default function App() {
   };
 
   const sendStopAndCleanup = ({ skipStop }: { skipStop?: boolean } = {}) => {
+    clearAutoCloseTimer();
     stopMicRef.current?.();
     stopMicRef.current = null;
     expectingAudio.current = false;
@@ -251,12 +269,13 @@ export default function App() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       return;
     }
+    clearAutoCloseTimer();
     setStatus("Connecting…");
     setHasStarted(true);
     setMicStatus("Requesting mic…");
     setAudioBytes(0);
     setAudioSeconds(0);
-    setTranscripts([]);
+    setChatMessages([]);
     setRecipientField("");
     setAmountField("");
     setNoteField("");
@@ -267,9 +286,13 @@ export default function App() {
     const ws = connectVoiceWS(
       (payload) => {
         if (payload?.type === "AGENT_MESSAGE") {
-          setAssistantMessages((prev) => [
+          setChatMessages((prev) => [
             ...prev,
-            { id: Date.now() + prev.length, text: payload.text ?? "" },
+            {
+              id: Date.now() + prev.length,
+              role: "assistant",
+              text: payload.text ?? "",
+            },
           ]);
         } else if (payload?.type === "TTS_AUDIO") {
           expectingAudio.current = true;
@@ -278,9 +301,15 @@ export default function App() {
           setAudioSeconds(payload.seconds_estimate ?? 0);
         } else if (payload?.type === "ASR_FINAL") {
           if (payload.text) {
-            setTranscripts((prev) => [...prev, payload.text as string]);
-            setAsrFlash(true);
-            setTimeout(() => setAsrFlash(false), 600);
+            const text = payload.text as string;
+            setChatMessages((prev) => [
+              ...prev,
+              {
+                id: Date.now() + prev.length,
+                role: "user",
+                text,
+              },
+            ]);
           }
         } else if (payload?.type === "UI_ACTIONS") {
           applyUiActions(payload.actions ?? []);
@@ -336,14 +365,19 @@ export default function App() {
       <div className="mx-auto flex max-w-5xl flex-col gap-8 px-4 py-10">
         <header className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
           <div>
-            <h1 className="text-3xl font-semibold leading-tight text-white">
-              TrustiPay Voice Prototype
+            <h1 className="text-2xl font-semibold leading-tight text-white">
+              TrustiPay
             </h1>
-            <p className="text-sm text-slate-300">
-              Milestone B — WS greeting + mic capture streaming (no ASR yet)
+            <p className="text-md text-slate-300">
+              Voice Controlled Dynamic Inclusive User Experience
             </p>
           </div>
           <div className="flex items-center gap-3">
+            {micStatus === "Streaming" && (
+              <span className="rounded-full bg-emerald-500/20 px-3 py-1 text-xs font-semibold text-emerald-200 ring-1 ring-emerald-500/40">
+                Listening…
+              </span>
+            )}
             <StatusBadge label={status} />
             <span className="rounded-full bg-slate-800 px-3 py-1 text-xs font-medium text-slate-200">
               Audio: {audioStatus}
@@ -354,27 +388,9 @@ export default function App() {
           </div>
         </header>
 
-        <div className="grid gap-6 md:grid-cols-[380px,1fr]">
-          <div className="rounded-3xl border border-slate-800 bg-slate-900/80 p-5 shadow-xl shadow-black/30 backdrop-blur">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs uppercase tracking-widest text-slate-400">
-                  Session
-                </p>
-                <p className="text-lg font-semibold text-white">
-                  Push to start
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                {micStatus === "Streaming" && (
-                  <span className="rounded-full bg-emerald-500/20 px-3 py-1 text-xs font-semibold text-emerald-200 ring-1 ring-emerald-500/40">
-                    Listening…
-                  </span>
-                )}
-                <div className="h-10 w-10 rounded-full bg-emerald-500/20 ring-1 ring-emerald-400/60"></div>
-              </div>
-            </div>
-            <div className="mt-4 grid grid-cols-2 gap-3">
+        <div className="flex flex-col gap-4 md:flex-row md:items-start">
+          <div className="flex w-2/3 flex-col gap-2 rounded-3xl border border-slate-800 bg-slate-900/80 p-5 shadow-xl shadow-black/30 backdrop-blur">
+            <div className="mt-1 grid grid-cols-2 gap-3">
               <button
                 className="rounded-xl bg-emerald-500 px-4 py-3 text-center text-base font-semibold text-slate-900 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300"
                 disabled={hasStarted && status === "Connected"}
@@ -392,25 +408,28 @@ export default function App() {
                 Stop
               </button>
             </div>
-            <p className="mt-2 text-xs text-slate-400">
-              Sends START_SESSION + AUDIO_CONFIG, starts mic streaming at 16 kHz
-              PCM, and waits for greeting audio.
-            </p>
 
-            <div className="mt-6 h-72 space-y-3 overflow-y-auto rounded-2xl bg-slate-950/60 p-4 ring-1 ring-slate-800">
-              {assistantMessages.length === 0 ? (
+            <div className="mt-1 h-96 space-y-3 overflow-y-auto rounded-2xl bg-slate-950/60 p-4 ring-1 ring-slate-800">
+              {chatMessages.length === 0 ? (
                 <div className="space-y-2 text-sm text-slate-400">
                   {greetingPlaceholder.map((line, idx) => (
                     <p key={idx}>{line}</p>
                   ))}
                 </div>
               ) : (
-                assistantMessages.map((msg) => (
+                chatMessages.map((msg) => (
                   <div
                     key={msg.id}
-                    className="max-w-[90%] rounded-2xl bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100 ring-1 ring-emerald-500/30"
+                    className={`max-w-[90%] rounded-2xl px-4 py-3 text-sm ring-1 ${
+                      msg.role === "assistant"
+                        ? "bg-emerald-500/10 text-emerald-100 ring-emerald-500/30"
+                        : "ml-auto bg-sky-500/10 text-sky-100 ring-sky-500/30"
+                    }`}
                   >
-                    {msg.text}
+                    <div className="text-[11px] uppercase tracking-widest text-slate-400/80">
+                      {msg.role === "assistant" ? "Assistant" : "You"}
+                    </div>
+                    <div className="mt-1 text-slate-100">{msg.text}</div>
                   </div>
                 ))
               )}
@@ -427,7 +446,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="rounded-3xl border border-slate-800 bg-slate-900/60 p-5 shadow-inner shadow-black/30 space-y-4">
+          <div className="flex w-1/3 h-full rounded-3xl border border-slate-800 bg-slate-900/60 p-5 shadow-inner shadow-black/30 space-y-4">
             <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-lg font-semibold text-white">App screen</h2>
@@ -438,72 +457,6 @@ export default function App() {
               <div className="mt-3 rounded-xl bg-slate-900/80 p-4 ring-1 ring-slate-800">
                 {renderScreen()}
               </div>
-            </div>
-
-            <div>
-              <h2 className="text-lg font-semibold text-white">
-                What this demo does
-              </h2>
-              <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-slate-200">
-                <li>Connects to FastAPI /ws on localhost:8000.</li>
-                <li>
-                  Sends a START_SESSION payload with the hardcoded user John.
-                </li>
-                <li>
-                  Declares AUDIO_CONFIG and streams 16 kHz pcm_s16le mic audio.
-                </li>
-                <li>Displays AGENT_MESSAGE bubbles from the backend.</li>
-                <li>Plays WAV bytes streamed after the TTS_AUDIO header.</li>
-                <li>Shows AUDIO_STATS from the backend as audio flows.</li>
-                <li>
-                  Displays ASR_FINAL transcripts when VAD segments speech.
-                </li>
-                <li>
-                  Applies UI_ACTIONS to navigate, fill fields, and prompt
-                  biometric.
-                </li>
-              </ul>
-              <div className="mt-4 rounded-2xl bg-slate-950/60 p-4 text-xs text-slate-400 ring-1 ring-slate-800">
-                Tip: Run the backend with{" "}
-                <code>uvicorn app:app --reload --port 8000</code> from{" "}
-                <code>backend/</code>, then start the frontend via{" "}
-                <code>npm run dev</code> in <code>frontend/</code>.
-              </div>
-            </div>
-
-            <div
-              className={`min-h-40 rounded-2xl border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-100 transition ${
-                asrFlash
-                  ? "ring-2 ring-emerald-400/60"
-                  : "ring-1 ring-slate-800"
-              }`}
-            >
-              <div className="flex items-center justify-between">
-                <p className="text-xs uppercase tracking-widest text-slate-400">
-                  Transcripts
-                </p>
-                {asrFlash && (
-                  <span className="text-[11px] font-semibold text-emerald-300">
-                    New ASR
-                  </span>
-                )}
-              </div>
-              {transcripts.length === 0 ? (
-                <p className="mt-2 text-xs text-slate-400">
-                  Utterances will appear here after VAD segmentation.
-                </p>
-              ) : (
-                <div className="mt-3 space-y-2">
-                  {transcripts.map((t, idx) => (
-                    <div
-                      key={idx}
-                      className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-slate-100 ring-1 ring-slate-800"
-                    >
-                      {t}
-                    </div>
-                  ))}
-                </div>
-              )}
             </div>
           </div>
         </div>

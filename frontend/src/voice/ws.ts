@@ -9,7 +9,7 @@ export function connectVoiceWS(
     ws.send(
       JSON.stringify({
         type: "START_SESSION",
-        user: { id: "u1", name: "John" },
+        user: { id: "u1", name: "Chinthana" },
         language: "en",
       })
     );
@@ -32,9 +32,12 @@ export function connectVoiceWS(
     }
 
     if (event.data instanceof Blob) {
-      event.data.arrayBuffer().then(onBinary).catch((err) => {
-        console.error("Failed to read binary message", err);
-      });
+      event.data
+        .arrayBuffer()
+        .then(onBinary)
+        .catch((err) => {
+          console.error("Failed to read binary message", err);
+        });
     }
   });
 

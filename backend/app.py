@@ -221,13 +221,13 @@ async def _handle_start_session(
     websocket: WebSocket, payload: Dict[str, Any], session_state: SessionState
 ) -> None:
     user = payload.get("user") or {}
-    name = user.get("name") or "John"
+    name = user.get("name") or "User"
     session_state.conversation.reset()
     session_state.conversation.user_name = name
     session_state.conversation.step = "idle"
     session_state.history.clear()
     session_state.last_tool_result = None
-    greeting = f"Hello {name}, I can help you with that."
+    greeting = f"Hello {name}, How can I help you today?."
     logger.info("Sending greeting to %s", name)
 
     await websocket.send_json({"type": "AGENT_MESSAGE", "text": greeting})

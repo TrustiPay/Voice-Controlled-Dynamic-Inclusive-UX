@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -38,6 +39,8 @@ def search_contact(query: str) -> Optional[Dict]:
 
     best: Optional[Dict] = None
     best_score = 0.0
+    best_fuzzy: Optional[Dict] = None
+    best_fuzzy_ratio = 0.0
 
     for c in load_contacts():
         label_raw = c.get("label") or ""
@@ -53,16 +56,32 @@ def search_contact(query: str) -> Optional[Dict]:
         token_overlap = len(query_tokens & label_tokens)
         score += token_overlap * 1.0
 
+        # Lightweight fuzzy similarity to handle ASR slips like "kv network" -> "kevin at work"
+        ratio = SequenceMatcher(None, norm_query, label).ratio()
+        score += ratio * 1.2
+        if ratio > best_fuzzy_ratio:
+            best_fuzzy_ratio = ratio
+            best_fuzzy = c
+
         # Light phone match support
         phone = _normalize(c.get("phone") or "")
         if phone and phone.endswith(norm_query):
             score += 1.0
 
-        if score > best_score or (score == best_score and best and len(label) < len(_normalize(best.get("label") or ""))):
+        if score > best_score or (
+            score == best_score
+            and best
+            and len(label) < len(_normalize(best.get("label") or ""))
+        ):
             best_score = score
             best = c
 
-    return best if best_score >= 1.0 else None
+    if best_score >= 1.0:
+        return best
+    # Fuzzy-only fallback when structured scores fail
+    if best_fuzzy and best_fuzzy_ratio >= 0.6:
+        return best_fuzzy
+    return None
 
 
 def append_ledger_entry(entry: Dict) -> None:

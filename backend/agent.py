@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
-from heuristics import is_affirmative, is_skip_note
+from heuristics import extract_amount, is_affirmative, is_skip_note
 from state import ConversationState
 
 logger = logging.getLogger("trustipay.agent")
@@ -81,7 +81,11 @@ class ExtractedSlots(BaseModel):
         if self.amount_lkr is not None and self.amount_lkr <= 0:
             self.amount_lkr = None
         if self.recipient_label:
-            self.recipient_label = self.recipient_label.strip()
+            cleaned = self.recipient_label.strip()
+            if cleaned.lower() in {"none", "null", "no one", "no-one", "someone", "anyone", ""}:
+                self.recipient_label = None
+            else:
+                self.recipient_label = cleaned
         if self.note is not None and isinstance(self.note, str):
             self.note = self.note.strip()
         return self
@@ -296,21 +300,24 @@ Otherwise, stick to the schema and avoid extra keys or comments.
         state_patch: Dict[str, Any] = {}
         actions: List[UIAction] = []
         user_confirmed = False
+        placeholder_labels = {"none", "null", "no one", "no-one", "someone", "anyone", ""}
 
         if slots:
             if slots.intent == "transfer":
                 state.intent = "transfer"
                 state_patch["intent"] = "transfer"
             if slots.recipient_label:
-                state.recipient_label = slots.recipient_label
-                # Reset contact_id until search confirms
-                state.recipient_contact_id = None
-                state_patch.update(
-                    {
-                        "recipient_label": state.recipient_label,
-                        "recipient_contact_id": None,
-                    }
-                )
+                new_label = slots.recipient_label.strip()
+                if new_label and new_label != state.recipient_label:
+                    state.recipient_label = new_label
+                    # Reset contact_id only when the recipient actually changed
+                    state.recipient_contact_id = None
+                    state_patch.update(
+                        {
+                            "recipient_label": state.recipient_label,
+                            "recipient_contact_id": None,
+                        }
+                    )
             if slots.amount_lkr:
                 state.amount_lkr = int(slots.amount_lkr)
                 state_patch["amount_lkr"] = state.amount_lkr
@@ -320,12 +327,23 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             if slots.confirm:
                 user_confirmed = True
 
+        if state.recipient_label:
+            label_lower = state.recipient_label.strip().lower()
+            if label_lower in placeholder_labels:
+                state.recipient_label = None
+                state_patch["recipient_label"] = None
+
         if user_text and is_affirmative(user_text):
             user_confirmed = True
         if user_text and is_skip_note(user_text):
             state.note = None
             state.pending_note = "skipped"
             state_patch.update({"note": None, "pending_note": "skipped"})
+        if state.amount_lkr is None and user_text:
+            amt = extract_amount(user_text)
+            if amt:
+                state.amount_lkr = amt
+                state_patch["amount_lkr"] = state.amount_lkr
 
         if state.intent is None and (slots is None or slots.intent == "unknown"):
             return AgentDecision(
