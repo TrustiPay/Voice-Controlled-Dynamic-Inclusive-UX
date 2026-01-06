@@ -1,6 +1,7 @@
 export function connectVoiceWS(
   onJson: (payload: any) => void,
-  onBinary: (data: ArrayBuffer) => void
+  onBinary: (data: ArrayBuffer) => void,
+  language: string = "en"
 ): WebSocket {
   const ws = new WebSocket("ws://localhost:8000/ws");
   ws.binaryType = "arraybuffer";
@@ -10,7 +11,7 @@ export function connectVoiceWS(
       JSON.stringify({
         type: "START_SESSION",
         user: { id: "u1", name: "Chinthana" },
-        language: "en",
+        language: language || "en",
       })
     );
   });

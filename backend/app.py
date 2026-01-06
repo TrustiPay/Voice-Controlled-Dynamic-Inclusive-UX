@@ -11,8 +11,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from starlette.websockets import WebSocketState  # type: ignore
 
-from agent import AgentDecision, agent
 from asr import transcribe_pcm16k
+from fsm import ActionBundle, Event, EventType, State, handle_event, validate_ui_actions
 from state import ConversationState
 from tools import append_ledger_entry, get_ledger, make_transfer_entry, search_contact
 from tts import synthesize_wav
@@ -47,6 +47,9 @@ class SessionState:
     conversation: ConversationState = field(default_factory=ConversationState)
     history: List[Dict[str, str]] = field(default_factory=list)
     last_tool_result: Optional[Dict[str, Any]] = None
+    language: str = "en"
+    utterance_language: Optional[str] = None
+    fsm_state: State = State.IDLE
 
     def seconds_estimate(self) -> float:
         cfg = self.audio_config or {}
@@ -72,6 +75,25 @@ ALLOWED_PATCH_FIELDS = {
     "awaiting_biometric",
 }
 
+LANG_TEXT = {
+    "greeting": {
+        "en": "Hello {name}, how can I help you today?",
+        "si": "ආයුබෝවන් {name}, මම කෙසේ උදව් කරන්නද?",
+    },
+    "transfer_incomplete": {
+        "en": "I cannot execute the transfer yet. Please complete the details.",
+        "si": "මට තවම ගෙවීම කළ නොහැක. කරුණාකර විස්තර සම්පූර්ණ කරන්න.",
+    },
+    "fingerprint_fail": {
+        "en": "Fingerprint verification failed. Please try again.",
+        "si": "ඇඟිලි රේඛා සත්‍යාපනය අසාර්ථකයි. නැවත උත්සාහ කරන්න.",
+    },
+    "transfer_done": {
+        "en": "Done. I sent {amount} LKR to {recipient}.",
+        "si": "අවසන්. රු. {amount} {recipient}ට යවා දීලා.",
+    },
+}
+
 
 def _apply_state_patch(conv: ConversationState, patch: Optional[Dict[str, Any]]) -> None:
     if not patch:
@@ -81,6 +103,22 @@ def _apply_state_patch(conv: ConversationState, patch: Optional[Dict[str, Any]])
             setattr(conv, key, value)
 
 
+def _tts_language(session_state: SessionState) -> str:
+    if session_state.language == "auto":
+        return (
+            session_state.utterance_language
+            or session_state.conversation.detected_language
+            or "en"
+        )
+    return session_state.language or "en"
+
+
+def _localized_text(key: str, session_state: SessionState, **kwargs: Any) -> str:
+    lang = _tts_language(session_state).split("-")[0]
+    template = LANG_TEXT.get(key, {}).get(lang) or LANG_TEXT.get(key, {}).get("en") or ""
+    return template.format(**kwargs)
+
+
 def _run_tool_call(tool_call: Dict[str, Any], session_state: SessionState) -> Dict[str, Any]:
     name = tool_call.get("name")
     args = tool_call.get("args") or {}
@@ -88,9 +126,9 @@ def _run_tool_call(tool_call: Dict[str, Any], session_state: SessionState) -> Di
     if name == "search_contact":
         query = args.get("query") or args.get("label") or ""
         result = search_contact(query)
-        return {"tool": "search_contact", "query": query, "result": result}
+        return {"tool": "search_contact", "result": result}
     if name == "get_history":
-        return {"tool": "get_history", "items": get_ledger()}
+        return {"tool": "get_history", "result": get_ledger()}
     if name == "prepare_transfer":
         contact_id = conv.recipient_contact_id
         amount = conv.amount_lkr
@@ -114,107 +152,93 @@ def _run_tool_call(tool_call: Dict[str, Any], session_state: SessionState) -> Di
         conv.draft_summary = summary
         return {
             "tool": "prepare_transfer",
-            "summary": summary,
-            "draft_id": conv.draft_id,
+            "result": {"summary": summary, "draft_id": conv.draft_id},
         }
     if name == "execute_transfer":
-        return {"tool": "execute_transfer", "error": "biometric_required"}
-    return {"error": f"unknown_tool_{name}"}
-
-
-async def _process_agent_decision(
-    websocket: WebSocket,
-    session_state: SessionState,
-    decision: AgentDecision,
-    loop_depth: int = 0,
-) -> None:
-    conv = session_state.conversation
-    _apply_state_patch(conv, decision.state_patch)
-
-    if decision.ui_actions:
-        await websocket.send_json(
-            {"type": "UI_ACTIONS", "actions": [a.dict(exclude_none=True) for a in decision.ui_actions]}
+        if (
+            conv.step != "awaiting_biometric"
+            or not conv.awaiting_biometric
+            or not conv.recipient_contact_id
+            or not conv.recipient_label
+            or conv.amount_lkr is None
+        ):
+            return {"tool": "execute_transfer", "error": "biometric_required"}
+        entry = make_transfer_entry(
+            conv.recipient_contact_id, conv.recipient_label, conv.amount_lkr, conv.note
         )
-
-    if decision.say:
-        await websocket.send_json({"type": "AGENT_MESSAGE", "text": decision.say})
-        audio_bytes = synthesize_wav(decision.say)
-        await websocket.send_json(
-            {"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(audio_bytes)}
-        )
-        await websocket.send_bytes(audio_bytes)
-        session_state.history.append({"role": "assistant", "content": decision.say})
-
-    if decision.tool_call and loop_depth < 2:
-        result = _run_tool_call(decision.tool_call.dict(), session_state)
-        session_state.last_tool_result = result
-        follow_up = agent.decide(
-            session_state.conversation, user_text=None, last_tool=result, history=session_state.history
-        )
-        await _process_agent_decision(websocket, session_state, follow_up, loop_depth + 1)
-    else:
-        session_state.last_tool_result = None
+        append_ledger_entry(entry)
+        ledger_items = get_ledger()
+        conv.step = "done"
+        conv.pending_transfer = None
+        conv.awaiting_biometric = False
+        conv.draft_id = None
+        conv.draft_summary = None
+        return {
+            "tool": "execute_transfer",
+            "result": {
+                "entry": entry,
+                "ledger": ledger_items,
+                "message": f"Done. I sent {conv.amount_lkr} LKR to {conv.recipient_label}.",
+            },
+        }
+    return {"tool": name or "unknown", "error": "unknown_tool"}
 
 
-async def _handle_user_utterance(
-    websocket: WebSocket, session_state: SessionState, transcript: str
-) -> None:
-    session_state.history.append({"role": "user", "content": transcript})
-    decision = agent.decide(
-        session_state.conversation,
-        user_text=transcript,
-        last_tool=session_state.last_tool_result,
-        history=session_state.history,
+async def _send_tts(websocket: WebSocket, text: str, session_state: SessionState) -> None:
+    audio_bytes = synthesize_wav(text, language=_tts_language(session_state))
+    await websocket.send_json(
+        {"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(audio_bytes)}
     )
-    await _process_agent_decision(websocket, session_state, decision)
+    await websocket.send_bytes(audio_bytes)
 
 
-async def _speak_and_act(
-    websocket: WebSocket, text: str, actions: Optional[List[Dict[str, Any]]] = None
-) -> None:
-    if text:
-        await websocket.send_json({"type": "AGENT_MESSAGE", "text": text})
-        audio_bytes = synthesize_wav(text)
-        await websocket.send_json(
-            {"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(audio_bytes)}
-        )
-        await websocket.send_bytes(audio_bytes)
+async def _apply_bundle(websocket: WebSocket, session_state: SessionState, bundle: ActionBundle) -> None:
+    conv = session_state.conversation
+    _apply_state_patch(conv, bundle.state_patch)
+    session_state.fsm_state = bundle.next_state
+    conv.step = bundle.next_state.value
+    if bundle.say:
+        await websocket.send_json({"type": "AGENT_MESSAGE", "text": bundle.say})
+        await _send_tts(websocket, bundle.say, session_state)
+        session_state.history.append({"role": "assistant", "content": bundle.say})
+
+    actions = validate_ui_actions(bundle.next_state, bundle.ui_actions or [])
     if actions:
         await websocket.send_json({"type": "UI_ACTIONS", "actions": actions})
 
 
-async def _execute_transfer(websocket: WebSocket, session_state: SessionState) -> None:
-    conv = session_state.conversation
-    if (
-        conv.step != "awaiting_biometric"
-        or not conv.awaiting_biometric
-        or not conv.recipient_contact_id
-        or not conv.recipient_label
-        or conv.amount_lkr is None
-    ):
-        await _speak_and_act(
-            websocket, "I cannot execute the transfer yet. Please complete the details."
-        )
-        return
+async def _process_event(
+    websocket: WebSocket, session_state: SessionState, event: Event, extract_mode: str = "heuristic"
+) -> None:
+    # User messages go into history
+    if event.type == EventType.USER_TEXT and event.text:
+        session_state.history.append({"role": "user", "content": event.text})
 
-    entry = make_transfer_entry(
-        conv.recipient_contact_id, conv.recipient_label, conv.amount_lkr, conv.note
-    )
-    append_ledger_entry(entry)
-    ledger_items = get_ledger()
-    conv.step = "done"
-    conv.pending_transfer = None
-    conv.awaiting_biometric = False
-    conv.draft_id = None
-    conv.draft_summary = None
+    loops = 0
+    pending_event: Optional[Event] = event
+    while pending_event and loops < 4:
+        bundle = handle_event(session_state.fsm_state, session_state.conversation, pending_event, extract_mode)
+        await _apply_bundle(websocket, session_state, bundle)
 
-    actions = [
-        {"type": "NAVIGATE", "screen": "success"},
-        {"type": "SHOW_TOAST", "message": "Payment sent"},
-        {"type": "SHOW_HISTORY", "items": ledger_items},
-    ]
-    message = f"Done. I sent {conv.amount_lkr} LKR to {conv.recipient_label}."
-    await _speak_and_act(websocket, message, actions)
+        pending_event = None
+        if bundle.tool_call:
+            tool_result = _run_tool_call(bundle.tool_call, session_state)
+            session_state.last_tool_result = tool_result
+            if tool_result.get("error"):
+                message = (
+                    _localized_text("transfer_incomplete", session_state)
+                    if tool_result["error"] == "biometric_required"
+                    else f"Sorry, there was a problem: {tool_result['error']}"
+                )
+                await websocket.send_json({"type": "AGENT_MESSAGE", "text": message})
+                await _send_tts(websocket, message, session_state)
+                break
+            pending_event = Event(
+                type=EventType.TOOL_RESULT,
+                tool_name=tool_result.get("tool"),
+                tool_result=tool_result.get("result"),
+            )
+        loops += 1
 
 
 async def _handle_start_session(
@@ -222,21 +246,23 @@ async def _handle_start_session(
 ) -> None:
     user = payload.get("user") or {}
     name = user.get("name") or "User"
+    session_state.language = str(payload.get("language") or "en").lower()
+    session_state.utterance_language = None
     session_state.conversation.reset()
     session_state.conversation.user_name = name
+    session_state.conversation.language = session_state.language
+    session_state.conversation.detected_language = None
     session_state.conversation.step = "idle"
     session_state.history.clear()
     session_state.last_tool_result = None
-    greeting = f"Hello {name}, How can I help you today?."
+    session_state.fsm_state = State.IDLE
+    start_event = Event(type=EventType.START_SESSION)
+    await _process_event(websocket, session_state, start_event)
+    greeting = _localized_text("greeting", session_state, name=name)
     logger.info("Sending greeting to %s", name)
 
     await websocket.send_json({"type": "AGENT_MESSAGE", "text": greeting})
-
-    audio_bytes = synthesize_wav(greeting)
-    await websocket.send_json(
-        {"type": "TTS_AUDIO", "mime": "audio/wav", "nbytes": len(audio_bytes)}
-    )
-    await websocket.send_bytes(audio_bytes)
+    await _send_tts(websocket, greeting, session_state)
 
 
 async def _handle_text_message(
@@ -261,19 +287,25 @@ async def _handle_text_message(
         logger.info("Received AUDIO_CONFIG: %s", session_state.audio_config)
     elif message_type == "BIOMETRIC_RESULT":
         ok = bool(payload.get("ok"))
-        if ok:
-            await _execute_transfer(websocket, session_state)
-        else:
-            await _speak_and_act(
-                websocket, "Fingerprint verification failed. Please try again."
-            )
+        await _process_event(websocket, session_state, Event(type=EventType.BIOMETRIC, biometric_ok=ok))
     elif message_type == "STOP":
         logger.info("Received STOP from client")
         final_utts = session_state.vad.flush()
         for utt in final_utts:
-            transcript = transcribe_pcm16k(utt)
-            await websocket.send_json({"type": "ASR_FINAL", "text": transcript})
-            await _handle_user_utterance(websocket, session_state, transcript)
+            transcript, detected_lang = transcribe_pcm16k(
+                utt, language=session_state.language
+            )
+            if session_state.language == "auto" and detected_lang:
+                session_state.utterance_language = detected_lang
+                session_state.conversation.detected_language = detected_lang
+            await websocket.send_json(
+                {"type": "ASR_FINAL", "text": transcript, "language": detected_lang}
+            )
+            await _process_event(
+                websocket,
+                session_state,
+                Event(type=EventType.USER_TEXT, text=transcript),
+            )
         return True
     else:
         logger.info("Unhandled message type %s", message_type)
@@ -316,11 +348,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 utterances = session_state.vad.accept_bytes(payload)
                 for utt in utterances:
                     session_state.utterance_count += 1
-                    transcript = transcribe_pcm16k(utt)
-                    await websocket.send_json(
-                        {"type": "ASR_FINAL", "text": transcript}
+                    transcript, detected_lang = transcribe_pcm16k(
+                        utt, language=session_state.language
                     )
-                    await _handle_user_utterance(websocket, session_state, transcript)
+                    if session_state.language == "auto" and detected_lang:
+                        session_state.utterance_language = detected_lang
+                        session_state.conversation.detected_language = detected_lang
+                    await websocket.send_json(
+                        {"type": "ASR_FINAL", "text": transcript, "language": detected_lang}
+                    )
+                    await _process_event(
+                        websocket,
+                        session_state,
+                        Event(type=EventType.USER_TEXT, text=transcript),
+                    )
 
                 now = time.time()
                 if now - session_state.last_stats_time >= 1.0:

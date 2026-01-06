@@ -35,6 +35,7 @@ export default function App() {
   const [audioStatus, setAudioStatus] = useState("Idle");
   const [hasStarted, setHasStarted] = useState(false);
   const [micStatus, setMicStatus] = useState("Idle");
+  const [language, setLanguage] = useState<"en" | "si" | "auto">("en");
   const [audioBytes, setAudioBytes] = useState(0);
   const [audioSeconds, setAudioSeconds] = useState(0);
   const [screen, setScreen] = useState<Screen>("home");
@@ -324,7 +325,8 @@ export default function App() {
         } finally {
           setAudioStatus("Idle");
         }
-      }
+      },
+      language
     );
 
     ws.addEventListener("open", async () => {
@@ -390,6 +392,22 @@ export default function App() {
 
         <div className="flex flex-col gap-4 md:flex-row md:items-start">
           <div className="flex w-2/3 flex-col gap-2 rounded-3xl border border-slate-800 bg-slate-900/80 p-5 shadow-xl shadow-black/30 backdrop-blur">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-slate-300">Language</span>
+                <select
+                  value={language}
+                  onChange={(e) =>
+                    setLanguage(e.target.value as "en" | "si" | "auto")
+                  }
+                  className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100"
+                >
+                  <option value="en">English (en)</option>
+                  <option value="si">Sinhala (si)</option>
+                  <option value="auto">Auto</option>
+                </select>
+              </div>
+            </div>
             <div className="mt-1 grid grid-cols-2 gap-3">
               <button
                 className="rounded-xl bg-emerald-500 px-4 py-3 text-center text-base font-semibold text-slate-900 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-300"

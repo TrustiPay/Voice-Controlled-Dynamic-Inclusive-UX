@@ -18,6 +18,8 @@ class ConversationState:
     user_name: str = "Chinthana"
     draft_id: Optional[str] = None
     awaiting_biometric: bool = False
+    language: str = "en"
+    detected_language: Optional[str] = None
 
     def reset(self) -> None:
         self.step = "idle"
@@ -31,6 +33,8 @@ class ConversationState:
         self.pending_transfer = None
         self.draft_id = None
         self.awaiting_biometric = False
+        self.language = "en"
+        self.detected_language = None
 
     def build_summary(self) -> str:
         amount = f"{self.amount_lkr} LKR" if self.amount_lkr is not None else "an amount"
