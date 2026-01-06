@@ -4,6 +4,7 @@ numpy<2
 torch
 torchaudio
 faster-whisper
+rapidfuzz
 langchain
 langchain-community
 pydantic

@@ -8,6 +8,11 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional
 
+try:
+    from rapidfuzz import fuzz
+except ImportError:  # pragma: no cover - optional dependency fallback
+    fuzz = None
+
 BASE_DIR = Path(__file__).resolve().parent
 CONTACTS_PATH = BASE_DIR / "data" / "contacts.json"
 LEDGER_PATH = BASE_DIR / "data" / "ledger.json"
@@ -27,10 +32,25 @@ def _normalize(text: str) -> str:
     return text
 
 
+def _fuzzy_score(a: str, b: str) -> float:
+    """
+    Return a similarity score between 0.0-1.0 using rapidfuzz when available,
+    otherwise fallback to SequenceMatcher.
+    """
+    if fuzz:
+        ratios = [
+            fuzz.ratio(a, b),
+            fuzz.partial_ratio(a, b),
+            fuzz.token_set_ratio(a, b),
+        ]
+        return max(ratios) / 100.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def search_contact(query: str) -> Optional[Dict]:
     """
     Fuzzy-ish search: substring, token overlap, and prefix scoring.
-    Keeps it deterministic without extra deps.
+    Uses rapidfuzz if available for better robustness.
     """
     norm_query = _normalize(query)
     if not norm_query:
@@ -56,9 +76,9 @@ def search_contact(query: str) -> Optional[Dict]:
         token_overlap = len(query_tokens & label_tokens)
         score += token_overlap * 1.0
 
-        # Lightweight fuzzy similarity to handle ASR slips like "kv network" -> "kevin at work"
-        ratio = SequenceMatcher(None, norm_query, label).ratio()
-        score += ratio * 1.2
+        # Fuzzy similarity to handle ASR slips like "kv network" -> "kevin at work"
+        ratio = _fuzzy_score(norm_query, label)
+        score += ratio * 1.5
         if ratio > best_fuzzy_ratio:
             best_fuzzy_ratio = ratio
             best_fuzzy = c
