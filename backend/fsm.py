@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from extract import SlotResult, extract_slots
-from heuristics import extract_amount, is_affirmative, is_skip_note
+from heuristics import extract_amount, extract_note, is_affirmative, is_skip_note
 
 
 class State(str, enum.Enum):
@@ -15,7 +16,6 @@ class State(str, enum.Enum):
     HELP = "HELP"
     ERROR_RECOVERY = "ERROR_RECOVERY"
     # Transfer substates
-    T_START = "T_START"
     T_COLLECT_RECIPIENT = "T_COLLECT_RECIPIENT"
     T_RESOLVE_CONTACT = "T_RESOLVE_CONTACT"
     T_COLLECT_AMOUNT = "T_COLLECT_AMOUNT"
@@ -103,7 +103,6 @@ TEXT = {
 
 STATE_SCREENS: Dict[State, str] = {
     State.IDLE: "home",
-    State.T_START: "transfer",
     State.T_COLLECT_RECIPIENT: "transfer",
     State.T_RESOLVE_CONTACT: "transfer",
     State.T_COLLECT_AMOUNT: "transfer",
@@ -170,11 +169,21 @@ def _summary(conv) -> str:
 def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristic") -> ActionBundle:
     lang = _lang(conv.language, conv.detected_language)
     bundle = ActionBundle(next_state=state, state_patch={"step": state.value})
+    nav_action: Optional[Dict[str, Any]] = None
 
     def ensure_nav(target_state: State) -> None:
         nav = _nav_for_state(target_state)
         if nav:
-            bundle.ui_actions.append(nav)
+            nonlocal nav_action
+            nav_action = nav
+
+    def finish() -> ActionBundle:
+        # Deduplicate NAVIGATE: keep the last requested nav only.
+        actions = [a for a in bundle.ui_actions if a.get("type") != "NAVIGATE"]
+        if nav_action:
+            actions.append(nav_action)
+        bundle.ui_actions = validate_ui_actions(bundle.next_state, actions)
+        return bundle
 
     if event.type == EventType.START_SESSION:
         conv.intent = None
@@ -186,7 +195,7 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
         conv.pending_note = None
         bundle.state_patch = {"step": "idle"}
         bundle.next_state = State.IDLE
-        return bundle
+        return finish()
 
     # --- HISTORY path ---
     if state in {State.IDLE, State.HISTORY} and event.type == EventType.USER_TEXT:
@@ -196,7 +205,7 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             bundle.tool_call = {"name": "get_history", "args": {}}
             bundle.next_state = State.HISTORY
             ensure_nav(State.HISTORY)
-            return bundle
+            return finish()
 
     if state == State.HISTORY and event.type == EventType.TOOL_RESULT:
         if event.tool_name == "get_history":
@@ -204,7 +213,7 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             bundle.ui_actions.append({"type": "SHOW_HISTORY", "items": event.tool_result or []})
             ensure_nav(State.HISTORY)
             bundle.next_state = State.HISTORY
-            return bundle
+            return finish()
 
     # --- TRANSFER flow ---
     if state == State.IDLE and event.type == EventType.USER_TEXT:
@@ -216,7 +225,7 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
                 bundle.say = _say("ask_recipient", lang)
                 ensure_nav(State.T_COLLECT_RECIPIENT)
                 bundle.next_state = State.T_COLLECT_RECIPIENT
-                return bundle
+                return finish()
         # seed slots if present
         conv.recipient_label = slots.recipient_label or conv.recipient_label
         conv.amount_lkr = slots.amount_lkr or conv.amount_lkr
@@ -226,29 +235,50 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             "amount_lkr": conv.amount_lkr,
             "note": conv.note,
             "intent": "transfer",
-            "step": State.T_START.value,
         }
-        bundle.next_state = State.T_START
         ensure_nav(State.T_COLLECT_RECIPIENT)
         bundle.say = _say("ask_recipient", lang) if not conv.recipient_label else _say("looking_up", lang)
         if conv.recipient_label:
             bundle.tool_call = {"name": "search_contact", "args": {"query": conv.recipient_label}}
             bundle.next_state = State.T_RESOLVE_CONTACT
+            bundle.state_patch["step"] = State.T_RESOLVE_CONTACT.value
         else:
-            bundle.say = _say("ask_recipient", lang)
-            ensure_nav(State.T_COLLECT_RECIPIENT)
+            bundle.state_patch["step"] = State.T_COLLECT_RECIPIENT.value
             bundle.next_state = State.T_COLLECT_RECIPIENT
-        return bundle
+        return finish()
 
     if state == State.T_COLLECT_RECIPIENT and event.type == EventType.USER_TEXT:
-        slots = extract_slots(event.text or "", mode=extract_mode)
-        if slots.recipient_label:
-            conv.recipient_label = slots.recipient_label
+        text = event.text or ""
+        stripped = text.strip()
+        slots = extract_slots(text, mode=extract_mode)
+
+        direct_recipient = stripped or None
+        heuristic_recipient = slots.recipient_label
+        command_like = bool(stripped and re.search(r"\b(send|transfer|pay)\b", stripped.lower()))
+
+        recipient_value: Optional[str] = None
+        if direct_recipient and not command_like:
+            recipient_value = direct_recipient
+        elif heuristic_recipient:
+            recipient_value = heuristic_recipient
+        elif direct_recipient:
+            cleaned = re.sub(r"\b(send|transfer|pay)\b", "", direct_recipient, flags=re.I)
+            cleaned = re.sub(r"^\s*(to|for)\s+", "", cleaned, flags=re.I).strip()
+            recipient_value = cleaned or direct_recipient
+
+        if recipient_value:
+            conv.recipient_label = recipient_value
             bundle.state_patch = {
                 "recipient_label": conv.recipient_label,
                 "recipient_contact_id": None,
                 "step": State.T_RESOLVE_CONTACT.value,
             }
+            if slots.amount_lkr:
+                conv.amount_lkr = slots.amount_lkr
+                bundle.state_patch["amount_lkr"] = conv.amount_lkr
+            if slots.note:
+                conv.note = slots.note
+                bundle.state_patch["note"] = conv.note
             bundle.say = _say("looking_up", lang)
             bundle.tool_call = {"name": "search_contact", "args": {"query": conv.recipient_label}}
             ensure_nav(State.T_RESOLVE_CONTACT)
@@ -257,7 +287,7 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             bundle.say = _say("ask_recipient", lang)
             ensure_nav(State.T_COLLECT_RECIPIENT)
             bundle.next_state = State.T_COLLECT_RECIPIENT
-        return bundle
+        return finish()
 
     if state == State.T_RESOLVE_CONTACT and event.type == EventType.TOOL_RESULT:
         if event.tool_name == "search_contact":
@@ -303,20 +333,14 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
                     bundle.say = _say("ask_amount", lang)
                     ensure_nav(State.T_COLLECT_AMOUNT)
                     bundle.next_state = State.T_COLLECT_AMOUNT
-        return bundle
+        return finish()
 
-    if state in {State.T_COLLECT_AMOUNT, State.T_COLLECT_RECIPIENT} and event.type == EventType.USER_TEXT:
-        slots = extract_slots(event.text or "", mode=extract_mode)
-        amt = slots.amount_lkr or extract_amount(event.text or "")
-        note_val = slots.note
+    if state == State.T_COLLECT_AMOUNT and event.type == EventType.USER_TEXT:
+        amt = extract_amount(event.text or "", allow_loose=True)
         if amt:
             conv.amount_lkr = int(amt)
             bundle.state_patch = {"amount_lkr": conv.amount_lkr}
             bundle.ui_actions.append({"type": "SET_FIELD", "field": "amount", "value": conv.amount_lkr})
-            if note_val:
-                conv.note = note_val
-                bundle.state_patch["note"] = conv.note
-                bundle.ui_actions.append({"type": "SET_FIELD", "field": "note", "value": conv.note})
             if conv.note:
                 summary = _summary(conv)
                 bundle.ui_actions.append({"type": "SHOW_CONFIRM", "summary": summary})
@@ -338,7 +362,7 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             bundle.say = _say("ask_amount", lang)
             ensure_nav(State.T_COLLECT_AMOUNT)
             bundle.next_state = State.T_COLLECT_AMOUNT
-        return bundle
+        return finish()
 
     if state == State.T_COLLECT_NOTE and event.type == EventType.USER_TEXT:
         text = event.text or ""
@@ -346,9 +370,9 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             conv.note = None
             conv.pending_note = "skipped"
         else:
-            slots = extract_slots(text, mode=extract_mode)
-            if slots.note:
-                conv.note = slots.note
+            conv.pending_note = None
+            candidate = extract_note(text) or text.strip()
+            conv.note = candidate or conv.note
         bundle.state_patch = {"note": conv.note, "pending_note": conv.pending_note, "step": State.T_CONFIRM.value}
         ensure_nav(State.T_CONFIRM)
         summary = _summary(conv)
@@ -360,11 +384,11 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             recipient=conv.recipient_label or "",
         )
         bundle.next_state = State.T_CONFIRM
-        return bundle
+        return finish()
 
     if state == State.T_CONFIRM and event.type == EventType.USER_TEXT:
         text = event.text or ""
-        amt = extract_amount(text)
+        amt = extract_amount(text, allow_loose=True)
         if amt:
             conv.amount_lkr = int(amt)
             bundle.state_patch = {"amount_lkr": conv.amount_lkr}
@@ -375,9 +399,21 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             bundle.state_patch["note"] = conv.note
             bundle.ui_actions.append({"type": "SET_FIELD", "field": "note", "value": conv.note})
         if is_affirmative(text):
+            if not conv.recipient_contact_id or not conv.recipient_label:
+                bundle.say = _say("ask_recipient", lang)
+                ensure_nav(State.T_COLLECT_RECIPIENT)
+                bundle.next_state = State.T_COLLECT_RECIPIENT
+                return finish()
+            if conv.amount_lkr is None:
+                bundle.say = _say("ask_amount", lang)
+                ensure_nav(State.T_COLLECT_AMOUNT)
+                bundle.next_state = State.T_COLLECT_AMOUNT
+                return finish()
             summary = _summary(conv)
             bundle.say = _say("prepare_transfer", lang)
             bundle.ui_actions.append({"type": "SHOW_CONFIRM", "summary": summary})
+            bundle.state_patch = bundle.state_patch or {}
+            bundle.state_patch.update({"step": State.T_AWAIT_BIOMETRIC.value})
             bundle.tool_call = {
                 "name": "prepare_transfer",
                 "args": {
@@ -399,16 +435,29 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
                 recipient=conv.recipient_label or "",
             )
             ensure_nav(State.T_CONFIRM)
+            bundle.state_patch = bundle.state_patch or {}
+            bundle.state_patch.update({"step": State.T_CONFIRM.value})
             bundle.next_state = State.T_CONFIRM
-        return bundle
+        return finish()
 
     if state == State.T_AWAIT_BIOMETRIC and event.type == EventType.TOOL_RESULT:
         if event.tool_name == "prepare_transfer":
+            result = event.tool_result or {}
+            if result.get("draft_id"):
+                conv.draft_id = result.get("draft_id")
+                bundle.state_patch = bundle.state_patch or {}
+                bundle.state_patch.update({"draft_id": conv.draft_id})
+            if result.get("summary"):
+                conv.draft_summary = result.get("summary")
+                bundle.state_patch = bundle.state_patch or {}
+                bundle.state_patch.update({"draft_summary": conv.draft_summary})
             bundle.say = _say("waiting_biometric", lang)
             bundle.ui_actions.append({"type": "PROMPT_BIOMETRIC"})
             ensure_nav(State.T_AWAIT_BIOMETRIC)
+            bundle.state_patch = bundle.state_patch or {}
+            bundle.state_patch.update({"step": State.T_AWAIT_BIOMETRIC.value})
             bundle.next_state = State.T_AWAIT_BIOMETRIC
-            return bundle
+            return finish()
 
     if state == State.T_AWAIT_BIOMETRIC:
         if event.type == EventType.BIOMETRIC:
@@ -421,12 +470,12 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
                 bundle.say = _say("waiting_biometric", lang)
                 ensure_nav(State.T_AWAIT_BIOMETRIC)
                 bundle.next_state = State.T_AWAIT_BIOMETRIC
-            return bundle
+            return finish()
         if event.type == EventType.USER_TEXT:
             bundle.say = _say("waiting_biometric", lang)
             ensure_nav(State.T_AWAIT_BIOMETRIC)
             bundle.next_state = State.T_AWAIT_BIOMETRIC
-            return bundle
+            return finish()
 
     if state == State.T_EXECUTE and event.type == EventType.TOOL_RESULT:
         if event.tool_name == "execute_transfer":
@@ -439,12 +488,12 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             )
             bundle.say = event.tool_result.get("message", "") if event.tool_result else ""
             bundle.next_state = State.T_SUCCESS
-        return bundle
+        return finish()
 
     if event.type == EventType.CANCEL:
         bundle.say = _say("cancelled", lang)
         ensure_nav(State.T_CANCELLED)
         bundle.next_state = State.T_CANCELLED
-        return bundle
+        return finish()
 
-    return bundle
+    return finish()

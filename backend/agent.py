@@ -411,7 +411,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             state.pending_note = "skipped"
             state_patch.update({"note": None, "pending_note": "skipped"})
         if state.amount_lkr is None and user_text:
-            amt = extract_amount(user_text)
+            amt = extract_amount(user_text, allow_loose=True)
             if amt:
                 state.amount_lkr = amt
                 state_patch["amount_lkr"] = state.amount_lkr
