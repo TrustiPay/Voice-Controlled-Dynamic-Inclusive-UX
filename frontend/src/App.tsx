@@ -36,6 +36,7 @@ export default function App() {
   const [hasStarted, setHasStarted] = useState(false);
   const [micStatus, setMicStatus] = useState("Idle");
   const [language, setLanguage] = useState<"en" | "si" | "auto">("en");
+  const [userName, setUserName] = useState("Chinthana");
   const [audioBytes, setAudioBytes] = useState(0);
   const [audioSeconds, setAudioSeconds] = useState(0);
   const [screen, setScreen] = useState<Screen>("home");
@@ -47,6 +48,8 @@ export default function App() {
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const expectingAudio = useRef(false);
+  const audioQueueRef = useRef<ArrayBuffer[]>([]);
+  const isPlayingAudio = useRef(false);
   const wsRef = useRef<WebSocket | null>(null);
   const stopMicRef = useRef<(() => void) | null>(null);
   const autoCloseTimerRef = useRef<number | null>(null);
@@ -65,6 +68,25 @@ export default function App() {
     if (autoCloseTimerRef.current) {
       clearTimeout(autoCloseTimerRef.current);
       autoCloseTimerRef.current = null;
+    }
+  };
+
+  const playNextAudio = async () => {
+    if (isPlayingAudio.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) return;
+    isPlayingAudio.current = true;
+    setAudioStatus("Playing audio…");
+    try {
+      await playWavBytes(next);
+    } catch (err) {
+      console.error("Audio playback failed", err);
+    } finally {
+      isPlayingAudio.current = false;
+      setAudioStatus("Idle");
+      if (audioQueueRef.current.length > 0) {
+        playNextAudio();
+      }
     }
   };
 
@@ -251,10 +273,13 @@ export default function App() {
     stopMicRef.current?.();
     stopMicRef.current = null;
     expectingAudio.current = false;
+    audioQueueRef.current = [];
+    isPlayingAudio.current = false;
     setMicStatus("Stopped");
     setHasStarted(false);
     setScreen("home");
     setBiometricPrompt(false);
+    setAudioStatus("Idle");
     if (!skipStop) {
       try {
         wsRef.current?.send(JSON.stringify({ type: "STOP" }));
@@ -270,6 +295,7 @@ export default function App() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       return;
     }
+    const normalizedName = userName.trim() || "User";
     clearAutoCloseTimer();
     setStatus("Connecting…");
     setHasStarted(true);
@@ -319,14 +345,11 @@ export default function App() {
       async (data) => {
         if (!expectingAudio.current) return;
         expectingAudio.current = false;
-        setAudioStatus("Playing audio…");
-        try {
-          await playWavBytes(data);
-        } finally {
-          setAudioStatus("Idle");
-        }
+        audioQueueRef.current.push(data);
+        void playNextAudio();
       },
-      language
+      language,
+      normalizedName
     );
 
     ws.addEventListener("open", async () => {
@@ -406,6 +429,15 @@ export default function App() {
                   <option value="si">Sinhala (si)</option>
                   <option value="auto">Auto</option>
                 </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-slate-300">Your name</span>
+                <input
+                  value={userName}
+                  onChange={(e) => setUserName(e.target.value)}
+                  className="w-40 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100"
+                  placeholder="Enter your name"
+                />
               </div>
             </div>
             <div className="mt-1 grid grid-cols-2 gap-3">
