@@ -156,8 +156,7 @@ def _run_tool_call(tool_call: Dict[str, Any], session_state: SessionState) -> Di
         }
     if name == "execute_transfer":
         if (
-            conv.step != "awaiting_biometric"
-            or not conv.awaiting_biometric
+            not conv.awaiting_biometric
             or not conv.recipient_contact_id
             or not conv.recipient_label
             or conv.amount_lkr is None

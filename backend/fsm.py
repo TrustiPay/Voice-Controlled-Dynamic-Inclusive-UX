@@ -210,10 +210,13 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
     if state == State.IDLE and event.type == EventType.USER_TEXT:
         slots = extract_slots(event.text or "", mode=extract_mode)
         if slots.intent != "transfer":
-            bundle.say = _say("ask_recipient", lang)
-            ensure_nav(State.T_COLLECT_RECIPIENT)
-            bundle.next_state = State.T_COLLECT_RECIPIENT
-            return bundle
+            if slots.recipient_label or slots.amount_lkr or slots.note:
+                slots.intent = "transfer"
+            else:
+                bundle.say = _say("ask_recipient", lang)
+                ensure_nav(State.T_COLLECT_RECIPIENT)
+                bundle.next_state = State.T_COLLECT_RECIPIENT
+                return bundle
         # seed slots if present
         conv.recipient_label = slots.recipient_label or conv.recipient_label
         conv.amount_lkr = slots.amount_lkr or conv.amount_lkr
@@ -232,6 +235,8 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
             bundle.tool_call = {"name": "search_contact", "args": {"query": conv.recipient_label}}
             bundle.next_state = State.T_RESOLVE_CONTACT
         else:
+            bundle.say = _say("ask_recipient", lang)
+            ensure_nav(State.T_COLLECT_RECIPIENT)
             bundle.next_state = State.T_COLLECT_RECIPIENT
         return bundle
 
@@ -269,28 +274,66 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
                 bundle.state_patch = {
                     "recipient_contact_id": conv.recipient_contact_id,
                     "recipient_label": conv.recipient_label,
-                    "step": State.T_COLLECT_AMOUNT.value,
                 }
-                bundle.ui_actions.extend(
-                    [
-                        {"type": "SET_FIELD", "field": "recipient", "value": conv.recipient_label},
-                    ]
-                )
-                bundle.say = _say("ask_amount", lang)
-                ensure_nav(State.T_COLLECT_AMOUNT)
-                bundle.next_state = State.T_COLLECT_AMOUNT
+                bundle.ui_actions.append({"type": "SET_FIELD", "field": "recipient", "value": conv.recipient_label})
+
+                # If amount is already known, skip asking again.
+                if conv.amount_lkr is not None:
+                    bundle.ui_actions.append({"type": "SET_FIELD", "field": "amount", "value": conv.amount_lkr})
+                    if conv.note:
+                        bundle.ui_actions.append({"type": "SET_FIELD", "field": "note", "value": conv.note})
+                        summary = _summary(conv)
+                        bundle.ui_actions.append({"type": "SHOW_CONFIRM", "summary": summary})
+                        bundle.state_patch["step"] = State.T_CONFIRM.value
+                        ensure_nav(State.T_CONFIRM)
+                        bundle.say = _say(
+                            "confirm_send",
+                            lang,
+                            amount=conv.amount_lkr if conv.amount_lkr is not None else "0",
+                            recipient=conv.recipient_label or "",
+                        )
+                        bundle.next_state = State.T_CONFIRM
+                    else:
+                        bundle.state_patch["step"] = State.T_COLLECT_NOTE.value
+                        bundle.say = _say("ask_note", lang)
+                        ensure_nav(State.T_COLLECT_NOTE)
+                        bundle.next_state = State.T_COLLECT_NOTE
+                else:
+                    bundle.state_patch["step"] = State.T_COLLECT_AMOUNT.value
+                    bundle.say = _say("ask_amount", lang)
+                    ensure_nav(State.T_COLLECT_AMOUNT)
+                    bundle.next_state = State.T_COLLECT_AMOUNT
         return bundle
 
     if state in {State.T_COLLECT_AMOUNT, State.T_COLLECT_RECIPIENT} and event.type == EventType.USER_TEXT:
         slots = extract_slots(event.text or "", mode=extract_mode)
         amt = slots.amount_lkr or extract_amount(event.text or "")
+        note_val = slots.note
         if amt:
             conv.amount_lkr = int(amt)
-            bundle.state_patch = {"amount_lkr": conv.amount_lkr, "step": State.T_COLLECT_NOTE.value}
+            bundle.state_patch = {"amount_lkr": conv.amount_lkr}
             bundle.ui_actions.append({"type": "SET_FIELD", "field": "amount", "value": conv.amount_lkr})
-            ensure_nav(State.T_COLLECT_NOTE)
-            bundle.say = _say("ask_note", lang)
-            bundle.next_state = State.T_COLLECT_NOTE
+            if note_val:
+                conv.note = note_val
+                bundle.state_patch["note"] = conv.note
+                bundle.ui_actions.append({"type": "SET_FIELD", "field": "note", "value": conv.note})
+            if conv.note:
+                summary = _summary(conv)
+                bundle.ui_actions.append({"type": "SHOW_CONFIRM", "summary": summary})
+                bundle.state_patch["step"] = State.T_CONFIRM.value
+                ensure_nav(State.T_CONFIRM)
+                bundle.say = _say(
+                    "confirm_send",
+                    lang,
+                    amount=conv.amount_lkr if conv.amount_lkr is not None else "0",
+                    recipient=conv.recipient_label or "",
+                )
+                bundle.next_state = State.T_CONFIRM
+            else:
+                bundle.state_patch["step"] = State.T_COLLECT_NOTE.value
+                ensure_nav(State.T_COLLECT_NOTE)
+                bundle.say = _say("ask_note", lang)
+                bundle.next_state = State.T_COLLECT_NOTE
         else:
             bundle.say = _say("ask_amount", lang)
             ensure_nav(State.T_COLLECT_AMOUNT)
@@ -325,6 +368,12 @@ def handle_event(state: State, conv, event: Event, extract_mode: str = "heuristi
         if amt:
             conv.amount_lkr = int(amt)
             bundle.state_patch = {"amount_lkr": conv.amount_lkr}
+        slots = extract_slots(text, mode=extract_mode)
+        if slots.note and not conv.note:
+            conv.note = slots.note
+            bundle.state_patch = bundle.state_patch or {}
+            bundle.state_patch["note"] = conv.note
+            bundle.ui_actions.append({"type": "SET_FIELD", "field": "note", "value": conv.note})
         if is_affirmative(text):
             summary = _summary(conv)
             bundle.say = _say("prepare_transfer", lang)

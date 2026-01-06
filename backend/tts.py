@@ -18,6 +18,9 @@ PIPER_MODEL_ENV: Final[str] = "PIPER_EN_VOICE"
 PIPER_BIN_ENV: Final[str] = "PIPER_BIN"
 SINHALA_MODEL_ENV: Final[str] = "SINHALA_TTS_MODEL"
 SINHALA_SPEAKER_ENV: Final[str] = "SINHALA_TTS_SPEAKER"
+PIPER_DEFAULT_DIR: Final[Path] = Path(__file__).resolve().parent / "models" / "piper-voices"
+PIPER_BUNDLE_DIR: Final[Path] = Path(__file__).resolve().parent / "models" / "piper"
+PIPER_BUNDLE_BIN: Final[Path] = PIPER_BUNDLE_DIR / "piper"
 
 DEFAULT_EN_COQUI: Final[str] = "tts_models/en/ljspeech/tacotron2-DDC"
 DEFAULT_SI_COQUI: Final[str] = "tts_models/si/si_lk/vits"
@@ -65,24 +68,74 @@ def _tts_with_coqui(model_name: str, text: str, speaker: Optional[str] = None) -
         return None
 
 
+def _discover_piper_voice() -> Optional[Path]:
+    """
+    Find a usable Piper voice in the repo (backend/models/piper-voices).
+    Prefers en_US-lessac-* if present, otherwise first .onnx file.
+    """
+    if not PIPER_DEFAULT_DIR.exists():
+        return None
+
+    candidates = sorted(PIPER_DEFAULT_DIR.glob("*.onnx"))
+    if not candidates:
+        return None
+
+    for cand in candidates:
+        if "en_US-lessac" in cand.name:
+            return cand
+    return candidates[0]
+
+
+def _find_piper_bin() -> Optional[str]:
+    """
+    Locate the Piper binary:
+    1) PIPER_BIN env
+    2) bundled binary at backend/models/piper/piper
+    3) fallback to PATH lookup ("piper")
+    """
+    env_bin = os.getenv(PIPER_BIN_ENV)
+    if env_bin:
+        return env_bin
+
+    if PIPER_BUNDLE_BIN.exists() and os.access(PIPER_BUNDLE_BIN, os.X_OK):
+        return str(PIPER_BUNDLE_BIN)
+
+    path_bin = shutil.which("piper")
+    return path_bin
+
+
 def _tts_with_piper(text: str) -> Optional[bytes]:
     """
     Use local Piper CLI if available. Requires env PIPER_EN_VOICE to point to a voice file.
     """
     model_path = os.getenv(PIPER_MODEL_ENV)
-    piper_bin = os.getenv(PIPER_BIN_ENV, "piper")
+    if not model_path:
+        auto_voice = _discover_piper_voice()
+        if auto_voice:
+            model_path = str(auto_voice)
+            logger.info("Using bundled Piper voice: %s", model_path)
+
+    piper_bin = _find_piper_bin()
 
     if not model_path:
         logger.debug("Piper skipped: %s env not set", PIPER_MODEL_ENV)
         return None
-    if not shutil.which(piper_bin):
-        logger.warning("Piper binary '%s' not found on PATH", piper_bin)
+    if not piper_bin:
+        logger.warning("Piper binary not found (set %s or install on PATH)", PIPER_BIN_ENV)
         return None
 
     voice = Path(model_path)
     if not voice.exists():
         logger.warning("Piper voice not found: %s", voice)
         return None
+
+    run_env = os.environ.copy()
+    if PIPER_BUNDLE_DIR.exists():
+        lib_path = run_env.get("LD_LIBRARY_PATH", "")
+        parts = [str(PIPER_BUNDLE_DIR)]
+        if lib_path:
+            parts.append(lib_path)
+        run_env["LD_LIBRARY_PATH"] = ":".join(parts)
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
         tmp_path = Path(tmp_wav.name)
@@ -94,6 +147,7 @@ def _tts_with_piper(text: str) -> Optional[bytes]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=run_env,
         )
         if proc.returncode != 0:
             stderr = proc.stderr.decode("utf-8", errors="ignore").strip()

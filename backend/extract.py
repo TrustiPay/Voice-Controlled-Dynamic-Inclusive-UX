@@ -26,13 +26,14 @@ def heuristic_extract(text: str) -> SlotResult:
     Lightweight extraction with regex/keywords. Keeps labels as-heard.
     """
     intent = "history" if "history" in text.lower() else "unknown"
-    if detect_transfer_intent(text) or intent == "history":
-        intent = "transfer" if intent != "history" else "history"
 
     recipient = extract_recipient_hint(text)
     amount = extract_amount(text)
     note = extract_note(text)
     confirm = is_affirmative(text)
+
+    if detect_transfer_intent(text) or recipient or amount or note:
+        intent = "transfer" if intent != "history" else "history"
 
     return SlotResult(
         intent=intent,

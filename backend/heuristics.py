@@ -53,9 +53,12 @@ def extract_note(text: str) -> Optional[str]:
     patterns = [
         r"add a note saying\s+(.+)",
         r"note(?: saying)?\s+(.+)",
+        r"with (?:a\s+)?note(?: saying)?[.:,-]?\s+(.+)",
         r"with a note\s+(.+)",
         r"message\s+(.+)",
         r"remark\s+(.+)",
+        r"with the note\s+(.+)",
+        r"note[.:,-]?\s+(.+)",
     ]
     for pat in patterns:
         m = re.search(pat, lower)
@@ -83,11 +86,15 @@ def is_note_request_only(text: str) -> bool:
 
 def extract_recipient_hint(text: str) -> Optional[str]:
     lower = text.lower()
-    m = re.search(r"(?:to|for)\s+([a-z0-9 ]{2,})", lower)
+    # Strip punctuation that often ends the recipient fragment
+    cleaned = re.sub(r"[,.!?]", " ", lower)
+    # Capture text after "to|for" until a connector like "with"/"and"/"note"
+    m = re.search(r"(?:to|for)\s+([a-z0-9 ']+)", cleaned)
     if m:
-        candidate = m.group(1).strip()
-        # Avoid generic phrases
-        if candidate not in {"my friend", "friend"}:
+        candidate = m.group(1)
+        candidate = re.split(r"\b(?:with|including|and|note)\b", candidate, maxsplit=1)[0].strip()
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if candidate and candidate not in {"my friend", "friend"}:
             return candidate
     return None
 
