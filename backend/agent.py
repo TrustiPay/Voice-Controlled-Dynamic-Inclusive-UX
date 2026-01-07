@@ -14,6 +14,61 @@ from state import ConversationState
 logger = logging.getLogger("trustipay.agent")
 
 
+LANG_TEXT: Dict[str, Dict[str, str]] = {
+    "found_contact": {
+        "en": "Found {recipient}. How much should I send?",
+        "si": "{recipient} හඳුනාගත්තා. කොපමණ මුදල් යවමුද?",
+    },
+    "contact_not_found": {
+        "en": "I could not find that contact. Who should I send to?",
+        "si": "ඒ සම්බන්ධතා සොයාගත නොවුණා. කාට මුදල් යවන්නද?",
+    },
+    "history_shown": {
+        "en": "Here is your recent history.",
+        "si": "ඔබගේ මෑත ඉතිහාසය මෙන්න.",
+    },
+    "history_fetch": {
+        "en": "Fetching your recent payments.",
+        "si": "ඔබගේ මෑත ගෙවීම් ගනිමින් සිටින්න.",
+    },
+    "need_recipient_amount": {
+        "en": "I need a recipient and amount before preparing the transfer.",
+        "si": "ගෙවීම සූදානම් කිරීමට පෙර ලාභියා සහ මුදල අවශ්‍යයි.",
+    },
+    "fingerprint_prompt": {
+        "en": "{summary} When you're ready, approve with fingerprint.",
+        "si": "{summary} සූදානම් විගස ඇඟිලි රේඛාවෙන් අනුමත කරන්න.",
+    },
+    "tool_error": {
+        "en": "Sorry, I couldn't handle that request safely.",
+        "si": "සමාවන්න, ඒ ඉල්ලීම ආරක්ෂිතව කළ නොහැකි වුණා.",
+    },
+    "ask_help": {
+        "en": "I can help send a payment or show your history. What would you like to do?",
+        "si": "ගෙවීමක් යැවීමට හෝ ඉතිහාසය බැලීමට මට උදව් කළ හැකිය. ඔබට කරන්න ඕනේ කුමක්ද?",
+    },
+    "waiting_biometric": {
+        "en": "Waiting for fingerprint approval to finish the transfer.",
+        "si": "ගෙවීම සම්පූර්ණ කිරීමට ඇඟිලි රේඛා අනුමැතිය රැඳී සිටී.",
+    },
+    "ask_recipient": {"en": "Who should I send to?", "si": "කාට මුදල් යවන්නද?"},
+    "looking_up": {"en": "Looking up {recipient}.", "si": "{recipient} සොයමින්."},
+    "ask_amount": {
+        "en": "How much should I send?",
+        "si": "කොපමණ මුදල් යවන්නද?",
+    },
+    "ask_note": {"en": "Do you want to add a note?", "si": "සටහනක් එකතු කරන්නද?"},
+    "confirm_send": {
+        "en": "I can send {amount} LKR to {recipient}. Should I proceed?",
+        "si": "රු. {amount} {recipient}ට යවන්නම්. දිගටම කරමුද?",
+    },
+    "preparing_transfer": {
+        "en": "Preparing your transfer.",
+        "si": "ඔබේ ගෙවීම සූදානම් කරමින්.",
+    },
+}
+
+
 class UIAction(BaseModel):
     type: Literal[
         "NAVIGATE",
@@ -111,6 +166,18 @@ class TrustiAgent:
         )
         self.max_tool_loops = 2
 
+    def _lang(self, state: ConversationState) -> str:
+        pref = (state.language or "en").split("-")[0].lower()
+        if pref == "auto":
+            detected = (state.detected_language or "").split("-")[0].lower()
+            return detected or "en"
+        return pref
+
+    def _say(self, key: str, state: ConversationState, **kwargs: Any) -> str:
+        lang = self._lang(state)
+        template = LANG_TEXT.get(key, {}).get(lang) or LANG_TEXT.get(key, {}).get("en") or ""
+        return template.format(**kwargs)
+
     def _build_extractor_messages(
         self, state: ConversationState, user_text: str
     ) -> List[Any]:
@@ -120,11 +187,13 @@ class TrustiAgent:
             f"contact_id: {state.recipient_contact_id}, amount_lkr: {state.amount_lkr}, "
             f"note: {state.note}, awaiting_biometric: {state.awaiting_biometric}."
         )
+        language_rule = f"Language preference: {state.language}. Respond in Sinhala when language=si. Keep contact labels as-is."
         system_prompt = f"""
 You are TrustiPay intent extractor.
 Return ONLY JSON. No markdown. No explanations. Do not wrap in code fences.
 Schema: {schema}
 Rules:
+{language_rule}
 - Use integers for amount_lkr; strip commas; if missing set null.
 - Never invent contact IDs; keep recipient_label exactly as heard.
 - confirm=true only when the user explicitly approves or says yes.
@@ -213,7 +282,9 @@ Otherwise, stick to the schema and avoid extra keys or comments.
                         type="SET_FIELD", field="recipient", value=state.recipient_label
                     ),
                 ]
-                say = f"Found {state.recipient_label}. How much should I send?"
+                say = self._say(
+                    "found_contact", state, recipient=state.recipient_label or ""
+                )
             else:
                 state.recipient_contact_id = None
                 state.step = "collect_recipient"
@@ -224,7 +295,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
                     UIAction(type="SHOW_TOAST", message="Contact not found"),
                     UIAction(type="NAVIGATE", screen="transfer"),
                 ]
-                say = "I could not find that contact. Who should I send to?"
+                say = self._say("contact_not_found", state)
             return AgentDecision(
                 say=say, ui_actions=actions, state_patch=state_patch or None
             )
@@ -235,7 +306,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             state.step = "history_shown"
             state_patch.update({"intent": "history", "step": state.step})
             actions = [UIAction(type="SHOW_HISTORY", items=items)]
-            say = "Here is your recent history."
+            say = self._say("history_shown", state)
             return AgentDecision(
                 say=say, ui_actions=actions, state_patch=state_patch or None
             )
@@ -247,7 +318,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
                 state_patch.update(
                     {"awaiting_biometric": False, "step": state.step}
                 )
-                say = "I need a recipient and amount before preparing the transfer."
+                say = self._say("need_recipient_amount", state)
                 actions = [UIAction(type="NAVIGATE", screen="transfer")]
                 return AgentDecision(
                     say=say, ui_actions=actions, state_patch=state_patch or None
@@ -267,13 +338,13 @@ Otherwise, stick to the schema and avoid extra keys or comments.
                 UIAction(type="SHOW_CONFIRM", summary=summary),
                 UIAction(type="PROMPT_BIOMETRIC"),
             ]
-            say = f"{summary} When you're ready, approve with fingerprint."
+            say = self._say("fingerprint_prompt", state, summary=summary)
             return AgentDecision(
                 say=say, ui_actions=actions, state_patch=state_patch or None
             )
 
         return AgentDecision(
-            say="Sorry, I couldn't handle that request safely.",
+            say=self._say("tool_error", state),
             ui_actions=[],
             state_patch=state_patch or None,
         )
@@ -285,7 +356,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
         state.step = "history_requested"
         state_patch = {"intent": "history", "step": state.step}
         return AgentDecision(
-            say="Fetching your recent payments.",
+            say=self._say("history_fetch", state),
             ui_actions=[],
             tool_call=ToolCall(name="get_history", args={}),
             state_patch=state_patch,
@@ -340,21 +411,21 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             state.pending_note = "skipped"
             state_patch.update({"note": None, "pending_note": "skipped"})
         if state.amount_lkr is None and user_text:
-            amt = extract_amount(user_text)
+            amt = extract_amount(user_text, allow_loose=True)
             if amt:
                 state.amount_lkr = amt
                 state_patch["amount_lkr"] = state.amount_lkr
 
         if state.intent is None and (slots is None or slots.intent == "unknown"):
             return AgentDecision(
-                say="I can help send a payment or show your history. What would you like to do?",
+                say=self._say("ask_help", state),
                 ui_actions=[UIAction(type="NAVIGATE", screen="home")],
                 state_patch=state_patch or None,
             )
 
         if state.awaiting_biometric:
             return AgentDecision(
-                say="Waiting for fingerprint approval to finish the transfer.",
+                say=self._say("waiting_biometric", state),
                 ui_actions=[UIAction(type="PROMPT_BIOMETRIC")],
                 state_patch=state_patch or None,
             )
@@ -372,7 +443,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             state_patch["step"] = state.step
             actions.append(UIAction(type="NAVIGATE", screen="transfer"))
             return AgentDecision(
-                say="Who should I send to?",
+                say=self._say("ask_recipient", state),
                 ui_actions=actions,
                 state_patch=state_patch or None,
             )
@@ -391,7 +462,9 @@ Otherwise, stick to the schema and avoid extra keys or comments.
                 ]
             )
             return AgentDecision(
-                say=f"Looking up {state.recipient_label}.",
+                say=self._say(
+                    "looking_up", state, recipient=state.recipient_label or ""
+                ),
                 ui_actions=actions,
                 tool_call=ToolCall(
                     name="search_contact", args={"query": state.recipient_label}
@@ -412,7 +485,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             state.step = "collect_amount"
             state_patch["step"] = state.step
             return AgentDecision(
-                say="How much should I send?",
+                say=self._say("ask_amount", state),
                 ui_actions=actions,
                 state_patch=state_patch or None,
             )
@@ -430,7 +503,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             state.step = "collect_note"
             state_patch.update({"pending_note": "asked", "step": state.step})
             return AgentDecision(
-                say="Do you want to add a note?",
+                say=self._say("ask_note", state),
                 ui_actions=actions,
                 state_patch=state_patch or None,
             )
@@ -442,7 +515,7 @@ Otherwise, stick to the schema and avoid extra keys or comments.
 
         if user_confirmed:
             return AgentDecision(
-                say="Preparing your transfer.",
+                say=self._say("preparing_transfer", state),
                 ui_actions=actions,
                 tool_call=ToolCall(
                     name="prepare_transfer",
@@ -457,7 +530,12 @@ Otherwise, stick to the schema and avoid extra keys or comments.
             )
 
         return AgentDecision(
-            say=f"I can send {state.amount_lkr} LKR to {state.recipient_label}. Should I proceed?",
+            say=self._say(
+                "confirm_send",
+                state,
+                amount=state.amount_lkr,
+                recipient=state.recipient_label or "",
+            ),
             ui_actions=actions,
             state_patch=state_patch or None,
         )
