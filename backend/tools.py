@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 try:
-    from rapidfuzz import fuzz
+    from rapidfuzz import fuzz # type: ignore
 except ImportError:  # pragma: no cover - optional dependency fallback
     fuzz = None
 

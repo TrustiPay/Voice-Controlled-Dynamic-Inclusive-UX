@@ -57,11 +57,11 @@ def _tts_with_coqui(model_name: str, text: str, speaker: Optional[str] = None) -
             _coqui_cache[model_name] = tts
             logger.info("Loaded Coqui TTS model: %s", model_name)
 
-        wav = tts.tts(text, speaker=speaker) if speaker else tts.tts(text)
+        wav = tts.tts(text, speaker=speaker) if speaker else tts.tts(text) # type: ignore
         import soundfile as sf  # type: ignore
 
         with io.BytesIO() as buf:
-            sf.write(buf, wav, tts.synthesizer.output_sample_rate, format="WAV")
+            sf.write(buf, wav, tts.synthesizer.output_sample_rate, format="WAV") # type: ignore
             return buf.getvalue()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Coqui TTS (%s) failed: %s", model_name, exc)
